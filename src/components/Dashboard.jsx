@@ -45,10 +45,6 @@ function Dashboard({ stats, viewPatientDetails, setActiveTab, authFetch }) {
           <p>King's Hospital Orthopedic Specialist Unit • Patient & Follow-Up Tracker</p>
         </div>
         <div className="header-action-section">
-          <button className="btn btn-secondary btn-sm" onClick={() => setActiveTab('excel')}>
-            <FileSpreadsheet size={16} />
-            Database Excel Sheet
-          </button>
           <button className="btn btn-primary" onClick={() => setActiveTab('patients')}>
             <UserPlus size={18} />
             Register Patient
