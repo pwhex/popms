@@ -19,9 +19,8 @@ function Login({ supabase, onLoginSuccess }) {
       // Excel PoC Bypass mode
       setTimeout(() => {
         onLoginSuccess({
-          user: { email: 'doctor@popms.com', id: 'poc-user-id' },
-          role: 'admin',
-          session: { access_token: 'poc-bypass-token' }
+          access_token: 'poc-bypass-token',
+          user: { email: 'doctor@popms.com', id: 'poc-user-id' }
         });
         setLoading(false);
       }, 600);
@@ -53,7 +52,7 @@ function Login({ supabase, onLoginSuccess }) {
             // Note: role verification is also queried in frontend app level, 
             // but we can pass user info.
           }
-          onLoginSuccess(data);
+          onLoginSuccess(data.session);
         }
       }
     } catch (err) {
