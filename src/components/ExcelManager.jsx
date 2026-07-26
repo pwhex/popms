@@ -41,12 +41,19 @@ function ExcelManager({ stats, onStatsChange }) {
       </div>
 
       {/* Connection status */}
-      <div className="sync-status-indicator">
+      <div 
+        className="sync-status-indicator" 
+        style={stats.dbEngine?.includes('PostgreSQL') ? { backgroundColor: 'var(--success-light)', borderColor: 'rgba(16, 185, 129, 0.15)', color: 'var(--success)' } : {}}
+      >
         <ShieldCheck size={26} />
         <div>
-          <strong style={{ fontSize: '1.05rem' }}>Active Local Connection Established</strong>
+          <strong style={{ fontSize: '1.05rem' }}>
+            {stats.dbEngine?.includes('PostgreSQL') ? 'Active Supabase Cloud Database Connected' : 'Active Local Connection Established'}
+          </strong>
           <p style={{ fontSize: '0.85rem', marginTop: '2px', opacity: 0.9 }}>
-            The Node server is reading and writing to your local Excel sheet file in real-time.
+            {stats.dbEngine?.includes('PostgreSQL') 
+              ? 'The Node server is reading and writing to your Supabase PostgreSQL cloud database in real-time over TLS.' 
+              : 'The Node server is reading and writing to your local Excel sheet file in real-time.'}
           </p>
         </div>
       </div>
@@ -55,19 +62,19 @@ function ExcelManager({ stats, onStatsChange }) {
       <div className="card excel-sync-card">
         <h3 style={{ fontSize: '1.15rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
           <Database size={20} style={{ color: 'var(--primary)' }} />
-          Database Properties & File Details
+          Database Properties & Connection Details
         </h3>
         
         <table className="sync-details-table">
           <tbody>
             <tr>
-              <td className="label-cell">File Name</td>
+              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Database Type' : 'File Name'}</td>
               <td className="value-cell" style={{ fontFamily: 'inherit', fontWeight: 500 }}>
-                popms_database.xlsx
+                {stats.dbEngine?.includes('PostgreSQL') ? 'Supabase cloud-hosted PostgreSQL' : 'popms_database.xlsx'}
               </td>
             </tr>
             <tr>
-              <td className="label-cell">Absolute Path</td>
+              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Connection URI' : 'Absolute Path'}</td>
               <td className="value-cell">
                 {stats.excelPath || 'c:\\Users\\FRACTAL\\Desktop\\Kings PMS\\popms_database.xlsx'}
               </td>
@@ -75,14 +82,23 @@ function ExcelManager({ stats, onStatsChange }) {
             <tr>
               <td className="label-cell">Database Engine</td>
               <td className="value-cell" style={{ fontFamily: 'inherit' }}>
-                Node.js ExcelJS Engine (Thread-Safe Reads/Writes)
+                {stats.dbEngine || 'Node.js ExcelJS Engine (Thread-Safe Reads/Writes)'}
               </td>
             </tr>
             <tr>
-              <td className="label-cell">Target Sheets</td>
+              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Target Tables' : 'Target Sheets'}</td>
               <td className="value-cell" style={{ fontFamily: 'inherit' }}>
-                <code>Patients</code> (Registered Profile Records) <br/>
-                <code>Visits</code> (Consultation History & Media Logs)
+                {stats.dbEngine?.includes('PostgreSQL') ? (
+                  <>
+                    <code>patients</code> (Demographics Table) <br/>
+                    <code>visits</code> (Clinical History & Media Table)
+                  </>
+                ) : (
+                  <>
+                    <code>Patients</code> (Registered Profile Records) <br/>
+                    <code>Visits</code> (Consultation History & Media Logs)
+                  </>
+                )}
               </td>
             </tr>
             <tr>
@@ -102,7 +118,9 @@ function ExcelManager({ stats, onStatsChange }) {
           </button>
           
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            Downloads the raw Excel workbook file directly for manual reviews or custom reports.
+            {stats.dbEngine?.includes('PostgreSQL')
+              ? 'Compiles the live Supabase PostgreSQL relational database tables into a structured Excel workbook (.xlsx) download on-the-fly.'
+              : 'Downloads the raw Excel workbook file directly for manual reviews or custom reports.'}
           </span>
         </div>
       </div>
