@@ -31,6 +31,18 @@ app.use('/uploads', express.static(UPLOADS_DIR));
 // Excel Database Path (Fallback/PoC only)
 const DB_FILE = path.join(__dirname, 'popms_database.xlsx');
 
+// Configure Storage for Multer (file upload)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, UPLOADS_DIR);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+const upload = multer({ storage });
+
 // Database Connection States
 let isPostgres = false;
 let pgPool = null;
