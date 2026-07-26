@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Database, FileSpreadsheet, Download, RefreshCw, AlertTriangle, ShieldCheck, HelpCircle } from 'lucide-react';
 
-function ExcelManager({ stats, onStatsChange }) {
+function ExcelManager({ stats, onStatsChange, session }) {
   const [downloading, setDownloading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -14,8 +14,10 @@ function ExcelManager({ stats, onStatsChange }) {
   const handleBackupDownload = async () => {
     setDownloading(true);
     try {
-      // Trigger native browser download for Excel sheet
-      window.open('/api/database/backup', '_blank');
+      // Trigger native browser download for Excel sheet with session token
+      const token = session?.access_token;
+      const downloadUrl = token ? `/api/database/backup?token=${token}` : '/api/database/backup';
+      window.open(downloadUrl, '_blank');
     } catch (e) {
       console.error(e);
       alert('Failed to initiate backup download.');

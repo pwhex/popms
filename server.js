@@ -7,6 +7,7 @@ import exceljs from 'exceljs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import pg from 'pg';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 const { Pool } = pg;
@@ -27,12 +28,21 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Excel Database Path (Fallback)
+// Excel Database Path (Fallback/PoC only)
 const DB_FILE = path.join(__dirname, 'popms_database.xlsx');
 
 // Database Connection States
 let isPostgres = false;
 let pgPool = null;
+let supabase = null;
+
+// Initialize Supabase Client if env is provided
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+
+if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
 
 // Date Formatter Helper
 const formatDate = (dateVal) => {
@@ -42,7 +52,7 @@ const formatDate = (dateVal) => {
   return d.toISOString().split('T')[0];
 };
 
-// Seed Mock Data Definitions (Used for both PostgreSQL and Excel initializations)
+// Seed Mock Data Definitions
 const mockPatients = [
   {
     out_patient_id: 'OP-2026-0001',
@@ -217,12 +227,85 @@ const mockVisits = [
   }
 ];
 
+// JWT Session Authentication Middleware
+const authenticateJWT = async (req, res, next) => {
+  if (!isPostgres) {
+    // Excel offline mode bypasses Supabase JWT token verification
+    req.user = { id: 'local-poc-id', email: 'doctor@popms.com', role: 'admin' };
+    return next();
+  }
+
+  let token = null;
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.query.token) {
+    token = req.query.token;
+  }
+
+  if (!token) {
+    return res.status(401).json({ error: 'Authorization token is missing or invalid.' });
+  }
+  try {
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured on the backend.' });
+    }
+    
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    
+    if (error || !user) {
+      return res.status(401).json({ error: 'Invalid or expired session token.' });
+    }
+
+    // Query local profiles table for user role
+    const profileResult = await pgPool.query('SELECT role FROM profiles WHERE id = $1', [user.id]);
+    
+    // Default to doctor if no profile row yet
+    let role = 'doctor';
+    if (profileResult.rows.length > 0) {
+      role = profileResult.rows[0].role;
+    } else {
+      // Create profile row if it doesn't exist (failsafe)
+      await pgPool.query('INSERT INTO profiles (id, email, role) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [user.id, user.email, 'doctor']);
+    }
+
+    req.user = {
+      id: user.id,
+      email: user.email,
+      role: role
+    };
+    next();
+  } catch (err) {
+    console.error('[Auth] Verification failed:', err.message);
+    return res.status(401).json({ error: 'Session authentication failed.' });
+  }
+};
+
+// Admin Protection Middleware
+const requireAdmin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') {
+    next();
+  } else {
+    res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+  }
+};
+
 // PostgreSQL Database Initializer
 async function initializePostgres() {
   const client = await pgPool.connect();
   try {
     console.log('[Database] Checking / creating relational tables in Supabase PGSQL...');
     
+    // Create profiles table (links to auth.users)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.profiles (
+        id UUID PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        role VARCHAR(50) DEFAULT 'doctor',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+      );
+    `);
+
     // Create Patients table
     await client.query(`
       CREATE TABLE IF NOT EXISTS patients (
@@ -255,6 +338,40 @@ async function initializePostgres() {
         follow_up_date DATE,
         follow_up_status VARCHAR(50)
       );
+    `);
+
+    // Create Database Triggers to automatically link profiles
+    console.log('[Database] Syncing authentication trigger in schema auth...');
+    await client.query(`
+      CREATE OR REPLACE FUNCTION public.handle_new_user()
+      RETURNS trigger AS $$
+      DECLARE
+        admin_count integer;
+      BEGIN
+        -- If this is the absolute first user, promote them to admin
+        SELECT COUNT(*) INTO admin_count FROM public.profiles WHERE role = 'admin';
+        IF admin_count = 0 THEN
+          INSERT INTO public.profiles (id, email, role)
+          VALUES (new.id, new.email, 'admin')
+          ON CONFLICT (id) DO NOTHING;
+        ELSE
+          INSERT INTO public.profiles (id, email, role)
+          VALUES (new.id, new.email, 'doctor')
+          ON CONFLICT (id) DO NOTHING;
+        END IF;
+        RETURN new;
+      END;
+      $$ LANGUAGE plpgsql SECURITY DEFINER;
+    `);
+
+    await client.query(`
+      DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+    `);
+    
+    await client.query(`
+      CREATE TRIGGER on_auth_user_created
+        AFTER INSERT ON auth.users
+        FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
     `);
 
     // Seed Patients if empty
@@ -436,24 +553,11 @@ async function updateExcelRow(sheetName, keyColName, keyValue, updateData) {
   await workbook.xlsx.writeFile(DB_FILE);
 }
 
-// Configure Storage for Multer (file upload)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage });
-
 // API: Get all patients
-app.get('/api/patients', async (req, res) => {
+app.get('/api/patients', authenticateJWT, async (req, res) => {
   try {
     if (isPostgres) {
       const result = await pgPool.query('SELECT * FROM patients ORDER BY registered_date DESC');
-      // Format Postgres Date Objects to clean YYYY-MM-DD strings
       const formatted = result.rows.map(r => ({
         ...r,
         dob: formatDate(r.dob),
@@ -471,7 +575,7 @@ app.get('/api/patients', async (req, res) => {
 });
 
 // API: Register a new patient
-app.post('/api/patients', async (req, res) => {
+app.post('/api/patients', authenticateJWT, async (req, res) => {
   try {
     const { out_patient_id, patient_name, mobile, dob, gender, hospital, unit, main_diagnosis } = req.body;
     
@@ -522,7 +626,7 @@ app.post('/api/patients', async (req, res) => {
 });
 
 // API: Get specific patient + their visit history
-app.get('/api/patients/:id', async (req, res) => {
+app.get('/api/patients/:id', authenticateJWT, async (req, res) => {
   try {
     const { id } = req.params;
     let patient = null;
@@ -572,7 +676,7 @@ app.get('/api/patients/:id', async (req, res) => {
 });
 
 // API: Add a visit for a patient
-app.post('/api/patients/:id/visits', async (req, res) => {
+app.post('/api/patients/:id/visits', authenticateJWT, async (req, res) => {
   try {
     const { id } = req.params;
     const { 
@@ -635,7 +739,7 @@ app.post('/api/patients/:id/visits', async (req, res) => {
 });
 
 // API: Update an existing visit (e.g. mark follow-up completed, or reschedule)
-app.patch('/api/visits/:visit_id', async (req, res) => {
+app.patch('/api/visits/:visit_id', authenticateJWT, async (req, res) => {
   try {
     const { visit_id } = req.params;
     const updateData = req.body;
@@ -661,7 +765,7 @@ app.patch('/api/visits/:visit_id', async (req, res) => {
 });
 
 // API: Get follow-ups list
-app.get('/api/followups', async (req, res) => {
+app.get('/api/followups', authenticateJWT, async (req, res) => {
   try {
     if (isPostgres) {
       const result = await pgPool.query(`
@@ -719,7 +823,7 @@ app.post('/api/upload', upload.single('media'), (req, res) => {
 });
 
 // API: Get summary statistics for Dashboard
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', authenticateJWT, async (req, res) => {
   try {
     let totalPatients = 0;
     let visitsToday = 0;
@@ -788,8 +892,51 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// API: Download Raw Excel Sheet Backup
-app.get('/api/database/backup', async (req, res) => {
+// API: Get user accounts (Admin only)
+app.get('/api/admin/users', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    if (isPostgres) {
+      const result = await pgPool.query('SELECT id, email, role, created_at FROM public.profiles ORDER BY created_at DESC');
+      const formatted = result.rows.map(r => ({
+        ...r,
+        created_at: formatDate(r.created_at)
+      }));
+      res.json(formatted);
+    } else {
+      res.json([
+        { id: 'poc-admin-id', email: 'doctor@popms.com', role: 'admin', created_at: new Date().toISOString().split('T')[0] }
+      ]);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to retrieve registered users.' });
+  }
+});
+
+// API: Change user role permissions (Admin only)
+app.patch('/api/admin/users/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;
+  
+  if (role !== 'admin' && role !== 'doctor') {
+    return res.status(400).json({ error: 'Invalid role assignment. Choose admin or doctor.' });
+  }
+
+  try {
+    if (isPostgres) {
+      await pgPool.query('UPDATE public.profiles SET role = $1 WHERE id = $2', [role, id]);
+      res.json({ message: 'User role updated successfully.' });
+    } else {
+      res.json({ message: 'User role updated successfully (Excel Mock).' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to assign user role.' });
+  }
+});
+
+// API: Download Raw Excel Sheet Backup (Admin only)
+app.get('/api/database/backup', authenticateJWT, requireAdmin, async (req, res) => {
   try {
     if (isPostgres) {
       console.log('[Database] Compiling Excel file on-the-fly from Supabase tables...');
@@ -890,32 +1037,43 @@ if (fs.existsSync(DIST_DIR)) {
 app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
   
-  if (process.env.DATABASE_URL) {
-    console.log('[Database] DATABASE_URL provided. Attempting to connect to Supabase PostgreSQL...');
+  const USE_LOCAL_EXCEL = process.env.USE_LOCAL_EXCEL === 'true';
+  
+  if (USE_LOCAL_EXCEL) {
+    console.log('[Database] USE_LOCAL_EXCEL is enabled. Running in offline Excel Mode.');
+    isPostgres = false;
+    await initializeExcelDatabase();
+  } else {
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) {
+      console.error('\n❌ DATABASE CONNECTION ERROR: DATABASE_URL is missing in environment variables.');
+      console.error('To run in offline PoC mode, set USE_LOCAL_EXCEL=true in your .env file.');
+      console.error('To connect to Supabase Cloud, add the DATABASE_URL connection string.\n');
+      process.exit(1);
+    }
+    
+    console.log('[Database] Connecting to Supabase PostgreSQL...');
     try {
       pgPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+        connectionString: dbUrl,
         ssl: {
-          rejectUnauthorized: false // Required for hosted databases like Supabase in some environments
+          rejectUnauthorized: false
         }
       });
       
-      // Test basic connection
+      // Test connection
       await pgPool.query('SELECT NOW()');
       console.log('[Database] Successfully connected to Supabase PostgreSQL cloud database!');
       isPostgres = true;
       
-      // Initialize Postgres tables and seed mock data
+      // Initialize SQL Tables, Profiles, Triggers, and Seed
       await initializePostgres();
       
     } catch (err) {
-      console.error('[Database] Failed to connect to PostgreSQL. Reverting to local Excel mode.', err.message);
-      isPostgres = false;
-      await initializeExcelDatabase();
+      console.error('\n❌ DATABASE CONNECTION ERROR: Failed to connect to Supabase PostgreSQL.');
+      console.error(err.message);
+      console.error('App start aborted. Verify database credentials.\n');
+      process.exit(1);
     }
-  } else {
-    console.log('[Database] No DATABASE_URL found in .env. Running in offline Excel Mode.');
-    isPostgres = false;
-    await initializeExcelDatabase();
   }
 });

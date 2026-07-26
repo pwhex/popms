@@ -1,12 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Users, Calendar, Database, HeartPulse, Sparkles } from 'lucide-react';
+import { Activity, Users, Calendar, Database, HeartPulse, Sparkles, Key, LogOut } from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
 import Dashboard from './components/Dashboard.jsx';
 import PatientDirectory from './components/PatientDirectory.jsx';
 import PatientDetails from './components/PatientDetails.jsx';
 import FollowUpTracker from './components/FollowUpTracker.jsx';
 import ExcelManager from './components/ExcelManager.jsx';
+import Login from './components/Login.jsx';
+import AdminPanel from './components/AdminPanel.jsx';
+
+// Supabase Configuration
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://iecekupqbcexwiyuoxeq.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_wvT3hBOG8uhWSlzE7gdFEw_vkrG1gNz';
+
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes('[your-')) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
 
 function App() {
+  const [session, setSession] = useState(null);
+  const [userRole, setUserRole] = useState('doctor'); // 'admin' or 'doctor'
+  const [profileLoading, setProfileLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedPatientId, setSelectedPatientId] = useState(null);
   const [stats, setStats] = useState({
@@ -15,12 +30,83 @@ function App() {
     pendingFollowUps: 0,
     overdueFollowUps: 0,
     recentRegistrations: 0,
-    excelPath: ''
+    excelPath: '',
+    dbEngine: 'Local Microsoft Excel Worksheet'
   });
 
-  const fetchStats = async () => {
+  // Fetch User Role Profile from Supabase
+  const fetchUserProfile = async (currentUser) => {
+    if (!supabase || !currentUser) return;
+    setProfileLoading(true);
     try {
-      const res = await fetch('/api/stats');
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', currentUser.id)
+        .single();
+      
+      if (data) {
+        setUserRole(data.role || 'doctor');
+      } else if (error) {
+        console.error('Error fetching role:', error.message);
+        setUserRole('doctor');
+      }
+    } catch (err) {
+      console.error(err);
+      setUserRole('doctor');
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (supabase) {
+      // Get initial session
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        setSession(session);
+        if (session) {
+          fetchUserProfile(session.user);
+        }
+      });
+
+      // Listen to auth changes
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
+        setSession(currentSession);
+        if (currentSession) {
+          fetchUserProfile(currentSession.user);
+        } else {
+          setUserRole('doctor');
+          setStats(prev => ({ ...prev, dbEngine: 'Local Microsoft Excel Worksheet' }));
+        }
+      });
+
+      return () => subscription.unsubscribe();
+    } else {
+      // Offline PoC mode default session
+      setSession({
+        access_token: 'poc-bypass-token',
+        user: { email: 'doctor@popms.com', id: 'poc-user-id' }
+      });
+      setUserRole('admin');
+    }
+  }, []);
+
+  // Authenticated Fetch wrapper helper
+  const authFetch = async (url, options = {}) => {
+    const headers = options.headers || {};
+    if (session && session.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+    return fetch(url, {
+      ...options,
+      headers
+    });
+  };
+
+  const fetchStats = async () => {
+    if (!session) return;
+    try {
+      const res = await authFetch('/api/stats');
       if (res.ok) {
         const data = await res.json();
         setStats(data);
@@ -31,12 +117,22 @@ function App() {
   };
 
   useEffect(() => {
-    fetchStats();
-  }, [activeTab]);
+    if (session) {
+      fetchStats();
+    }
+  }, [activeTab, session]);
 
   const viewPatientDetails = (id) => {
     setSelectedPatientId(id);
     setActiveTab('patient-details');
+  };
+
+  const handleLogout = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    } else {
+      setSession(null);
+    }
   };
 
   // Render sub-components based on activeTab
@@ -48,6 +144,7 @@ function App() {
             stats={stats} 
             viewPatientDetails={viewPatientDetails} 
             setActiveTab={setActiveTab}
+            authFetch={authFetch}
           />
         );
       case 'patients':
@@ -55,6 +152,7 @@ function App() {
           <PatientDirectory 
             viewPatientDetails={viewPatientDetails} 
             onStatsChange={fetchStats}
+            authFetch={authFetch}
           />
         );
       case 'patient-details':
@@ -63,6 +161,7 @@ function App() {
             patientId={selectedPatientId} 
             onBack={() => setActiveTab('patients')} 
             onStatsChange={fetchStats}
+            authFetch={authFetch}
           />
         );
       case 'followups':
@@ -70,6 +169,7 @@ function App() {
           <FollowUpTracker 
             viewPatientDetails={viewPatientDetails} 
             onStatsChange={fetchStats}
+            authFetch={authFetch}
           />
         );
       case 'excel':
@@ -77,12 +177,26 @@ function App() {
           <ExcelManager 
             stats={stats} 
             onStatsChange={fetchStats}
+            session={session}
+          />
+        );
+      case 'users':
+        return (
+          <AdminPanel 
+            session={session}
           />
         );
       default:
-        return <Dashboard stats={stats} viewPatientDetails={viewPatientDetails} setActiveTab={setActiveTab} />;
+        return <Dashboard stats={stats} viewPatientDetails={viewPatientDetails} setActiveTab={setActiveTab} authFetch={authFetch} />;
     }
   };
+
+  // If no auth session, render Login Portal
+  if (!session) {
+    return <Login supabase={supabase} onLoginSuccess={(data) => setSession(data)} />;
+  }
+
+  const isAdmin = userRole === 'admin';
 
   return (
     <div className="app-container">
@@ -123,19 +237,49 @@ function App() {
             <span>Follow-Ups</span>
           </div>
           
-          <div 
-            className={`nav-item ${activeTab === 'excel' ? 'active' : ''}`}
-            onClick={() => { setActiveTab('excel'); setSelectedPatientId(null); }}
-          >
-            <Database size={20} />
-            <span>Excel Sheet</span>
-          </div>
+          {/* Admin Restricted Database Configuration */}
+          {isAdmin && (
+            <div 
+              className={`nav-item ${activeTab === 'excel' ? 'active' : ''}`}
+              onClick={() => { setActiveTab('excel'); setSelectedPatientId(null); }}
+            >
+              <Database size={20} />
+              <span>Database Manager</span>
+            </div>
+          )}
+
+          {/* Admin Restricted Access Control */}
+          {isAdmin && (
+            <div 
+              className={`nav-item ${activeTab === 'users' ? 'active' : ''}`}
+              onClick={() => { setActiveTab('users'); setSelectedPatientId(null); }}
+            >
+              <Key size={20} />
+              <span>User Accounts</span>
+            </div>
+          )}
         </nav>
 
-        <div className="sidebar-footer">
+        {/* Logged in User profile & Logout */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '20px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '0.8rem', color: '#94a3b8', padding: '0 8px' }}>
+            <span style={{ fontWeight: 700, color: '#ffffff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={session.user?.email}>
+              {session.user?.email}
+            </span>
+            <span style={{ textTransform: 'uppercase', fontSize: '0.7rem', fontWeight: 700, color: isAdmin ? 'var(--danger)' : 'var(--secondary)' }}>
+              Role: {userRole}
+            </span>
+          </div>
+          <button className="btn btn-outline btn-sm" onClick={handleLogout} style={{ width: '100%', justifyContent: 'center', backgroundColor: 'transparent', borderColor: 'rgba(255,255,255,0.12)', color: '#94a3b8' }}>
+            <LogOut size={14} />
+            Log Out
+          </button>
+        </div>
+
+        <div className="sidebar-footer" style={{ marginTop: '20px' }}>
           <Sparkles size={14} style={{ color: '#fbbf24', marginBottom: '4px' }} />
           <div>Kings Hospital</div>
-          <div>v1.0.0 (Excel DB)</div>
+          <div>v1.1.0 (SQL / Cloud)</div>
         </div>
       </aside>
 

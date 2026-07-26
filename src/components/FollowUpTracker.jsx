@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, CheckCircle, Clock, AlertTriangle, User, Search, RefreshCw, X, ChevronRight } from 'lucide-react';
 
-function FollowUpTracker({ viewPatientDetails, onStatsChange }) {
+function FollowUpTracker({ viewPatientDetails, onStatsChange, authFetch }) {
   const [followUps, setFollowUps] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -11,10 +11,12 @@ function FollowUpTracker({ viewPatientDetails, onStatsChange }) {
   const [rescheduleVisitId, setRescheduleVisitId] = useState(null);
   const [newFollowUpDate, setNewFollowUpDate] = useState('');
 
+  const apiFetch = authFetch || fetch;
+
   const fetchFollowUps = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/followups');
+      const res = await apiFetch('/api/followups');
       if (res.ok) {
         const data = await res.json();
         setFollowUps(data);
@@ -32,7 +34,7 @@ function FollowUpTracker({ viewPatientDetails, onStatsChange }) {
 
   const handleMarkCompleted = async (visitId) => {
     try {
-      const res = await fetch(`/api/visits/${visitId}`, {
+      const res = await apiFetch(`/api/visits/${visitId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ follow_up_status: 'Completed' })
@@ -54,7 +56,7 @@ function FollowUpTracker({ viewPatientDetails, onStatsChange }) {
     if (!newFollowUpDate) return;
     
     try {
-      const res = await fetch(`/api/visits/${rescheduleVisitId}`, {
+      const res = await apiFetch(`/api/visits/${rescheduleVisitId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 

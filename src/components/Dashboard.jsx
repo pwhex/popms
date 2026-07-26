@@ -1,15 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { Users, Calendar, AlertTriangle, Clock, ChevronRight, UserPlus, FileSpreadsheet } from 'lucide-react';
 
-function Dashboard({ stats, viewPatientDetails, setActiveTab }) {
+function Dashboard({ stats, viewPatientDetails, setActiveTab, authFetch }) {
   const [recentPatients, setRecentPatients] = useState([]);
   const [upcomingFollowups, setUpcomingFollowups] = useState([]);
+  const apiFetch = authFetch || fetch;
 
   useEffect(() => {
     // Fetch recent patient list
     const loadDashboardData = async () => {
       try {
-        const resPatients = await fetch('/api/patients');
+        const resPatients = await apiFetch('/api/patients');
         if (resPatients.ok) {
           const patients = await resPatients.json();
           // Sort by registration date decending
@@ -17,7 +18,7 @@ function Dashboard({ stats, viewPatientDetails, setActiveTab }) {
           setRecentPatients(sorted.slice(0, 4));
         }
 
-        const resFollowups = await fetch('/api/followups');
+        const resFollowups = await apiFetch('/api/followups');
         if (resFollowups.ok) {
           const followups = await resFollowups.json();
           const today = new Date().toISOString().split('T')[0];

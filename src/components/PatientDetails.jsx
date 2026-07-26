@@ -2,12 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ArrowLeft, Plus, Calendar, Activity, Image as ImageIcon, Link as LinkIcon, FileText, CheckCircle, Upload, X, AlertTriangle } from 'lucide-react';
 import { calculateAge } from './PatientDirectory.jsx';
 
-function PatientDetails({ patientId, onBack, onStatsChange }) {
+function PatientDetails({ patientId, onBack, onStatsChange, authFetch }) {
   const [patient, setPatient] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeSubTab, setActiveSubTab] = useState('timeline');
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  
+  const apiFetch = authFetch || fetch;
   
   // Visit Form State
   const [visitFormData, setVisitFormData] = useState({
@@ -30,7 +32,7 @@ function PatientDetails({ patientId, onBack, onStatsChange }) {
   const fetchPatientDetails = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/patients/${patientId}`);
+      const res = await apiFetch(`/api/patients/${patientId}`);
       if (res.ok) {
         const data = await res.json();
         setPatient(data);
@@ -95,7 +97,7 @@ function PatientDetails({ patientId, onBack, onStatsChange }) {
     fd.append('media', file);
 
     try {
-      const res = await fetch('/api/upload', {
+      const res = await apiFetch('/api/upload', {
         method: 'POST',
         body: fd
       });
@@ -146,7 +148,7 @@ function PatientDetails({ patientId, onBack, onStatsChange }) {
     }
 
     try {
-      const res = await fetch(`/api/patients/${patientId}/visits`, {
+      const res = await apiFetch(`/api/patients/${patientId}/visits`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)

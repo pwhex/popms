@@ -25,7 +25,7 @@ export const calculateAge = (dob) => {
   return `${years}y ${months}m`;
 };
 
-function PatientDirectory({ viewPatientDetails, onStatsChange }) {
+function PatientDirectory({ viewPatientDetails, onStatsChange, authFetch }) {
   const [patients, setPatients] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGender, setSelectedGender] = useState('All');
@@ -34,6 +34,8 @@ function PatientDirectory({ viewPatientDetails, onStatsChange }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
+
+  const apiFetch = authFetch || fetch;
 
   // Form State
   const [formData, setFormData] = useState({
@@ -49,7 +51,7 @@ function PatientDirectory({ viewPatientDetails, onStatsChange }) {
 
   const fetchPatients = async () => {
     try {
-      const res = await fetch('/api/patients');
+      const res = await apiFetch('/api/patients');
       if (res.ok) {
         const data = await res.json();
         setPatients(data);
@@ -105,7 +107,7 @@ function PatientDirectory({ viewPatientDetails, onStatsChange }) {
     }
 
     try {
-      const res = await fetch('/api/patients', {
+      const res = await apiFetch('/api/patients', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData)
