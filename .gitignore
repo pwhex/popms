@@ -1,0 +1,16 @@
+# Node Dependencies
+node_modules/
+npm-debug.log*
+
+# Production Build output
+dist/
+
+# Local databases & patient medical photos (HIPAA & Confidentiality protection)
+*.xlsx
+uploads/
+
+# System files
+.DS_Store
+Thumbs.db
+IPHONE_*.png
+Desktop.ini
