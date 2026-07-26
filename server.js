@@ -874,6 +874,18 @@ app.get('/api/database/backup', async (req, res) => {
   }
 });
 
+// Serve static assets in production (if built)
+const DIST_DIR = path.join(__dirname, 'dist');
+if (fs.existsSync(DIST_DIR)) {
+  console.log(`[Production] Detected static build folder. Enabling single-service static hosting.`);
+  app.use(express.static(DIST_DIR));
+  app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
+      res.sendFile(path.join(DIST_DIR, 'index.html'));
+    }
+  });
+}
+
 // Start Server and Initialize Database Engine
 app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
