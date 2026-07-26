@@ -1098,4 +1098,4 @@ app.listen(PORT, async () => {
     }
   }
 });
-// Trigger nodemon reload for updated env config
+// Trigger nodemon reload for updated env config (added Supabase keys)
