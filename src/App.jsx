@@ -24,6 +24,7 @@ function App() {
   const [profileLoading, setProfileLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedPatientId, setSelectedPatientId] = useState(null);
+  const [dbStatus, setDbStatus] = useState({ isPostgres: null, dbEngine: 'Loading...' });
   const [stats, setStats] = useState({
     totalPatients: 0,
     visitsToday: 0,
@@ -60,35 +61,42 @@ function App() {
   };
 
   useEffect(() => {
-    if (supabase) {
-      // Get initial session
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        setSession(session);
-        if (session) {
-          fetchUserProfile(session.user);
-        }
-      });
+    // Query database engine status from Node server
+    fetch('/api/status')
+      .then(res => res.json())
+      .then(data => {
+        setDbStatus(data);
+        
+        if (data.isPostgres && supabase) {
+          supabase.auth.getSession().then(({ data: { session } }) => {
+            setSession(session);
+            if (session) {
+              fetchUserProfile(session.user);
+            }
+          });
 
-      // Listen to auth changes
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
-        setSession(currentSession);
-        if (currentSession) {
-          fetchUserProfile(currentSession.user);
+          const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
+            setSession(currentSession);
+            if (currentSession) {
+              fetchUserProfile(currentSession.user);
+            } else {
+              setUserRole('doctor');
+            }
+          });
+
+          return () => subscription.unsubscribe();
         } else {
-          setUserRole('doctor');
-          setStats(prev => ({ ...prev, dbEngine: 'Local Microsoft Excel Worksheet' }));
+          // In local Excel mode, keep session null until user clicks bypass
+          setStats(prev => ({ 
+            ...prev, 
+            dbEngine: 'Local Microsoft Excel Worksheet' 
+          }));
         }
+      })
+      .catch(err => {
+        console.error('Failed to load DB status:', err);
+        setDbStatus({ isPostgres: false, dbEngine: 'Local Microsoft Excel Worksheet' });
       });
-
-      return () => subscription.unsubscribe();
-    } else {
-      // Offline PoC mode default session
-      setSession({
-        access_token: 'poc-bypass-token',
-        user: { email: 'doctor@popms.com', id: 'poc-user-id' }
-      });
-      setUserRole('admin');
-    }
   }, []);
 
   // Authenticated Fetch wrapper helper
@@ -97,10 +105,16 @@ function App() {
     if (session && session.access_token) {
       headers['Authorization'] = `Bearer ${session.access_token}`;
     }
-    return fetch(url, {
+    const res = await fetch(url, {
       ...options,
       headers
     });
+    
+    if (res.status === 401) {
+      console.warn('[Session] Session expired or invalid. Logging out.');
+      handleLogout();
+    }
+    return res;
   };
 
   const fetchStats = async () => {
@@ -193,7 +207,17 @@ function App() {
 
   // If no auth session, render Login Portal
   if (!session) {
-    return <Login supabase={supabase} onLoginSuccess={(data) => setSession(data)} />;
+    return (
+      <Login 
+        supabase={dbStatus.isPostgres ? supabase : null} 
+        onLoginSuccess={(data) => { 
+          setSession(data); 
+          if (!dbStatus.isPostgres) {
+            setUserRole('admin');
+          }
+        }} 
+      />
+    );
   }
 
   const isAdmin = userRole === 'admin';

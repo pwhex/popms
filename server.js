@@ -820,6 +820,15 @@ app.get('/api/followups', authenticateJWT, async (req, res) => {
   }
 });
 
+// API: Public status check (Unauthenticated)
+app.get('/api/status', (req, res) => {
+  res.json({
+    isPostgres,
+    dbEngine: isPostgres ? 'PostgreSQL (Supabase Cloud)' : 'Local Microsoft Excel Worksheet',
+    useLocalExcel: process.env.USE_LOCAL_EXCEL === 'true'
+  });
+});
+
 // API: File Upload Endpoint
 app.post('/api/upload', upload.single('media'), (req, res) => {
   try {
@@ -1089,3 +1098,4 @@ app.listen(PORT, async () => {
     }
   }
 });
+// Trigger nodemon reload for updated env config
