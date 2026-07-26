@@ -61,42 +61,39 @@ function App() {
   };
 
   useEffect(() => {
-    // Query database engine status from Node server
+    // Query database engine status from Node server (unauthenticated)
     fetch('/api/status')
       .then(res => res.json())
       .then(data => {
         setDbStatus(data);
-        
-        if (data.isPostgres && supabase) {
-          supabase.auth.getSession().then(({ data: { session } }) => {
-            setSession(session);
-            if (session) {
-              fetchUserProfile(session.user);
-            }
-          });
-
-          const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
-            setSession(currentSession);
-            if (currentSession) {
-              fetchUserProfile(currentSession.user);
-            } else {
-              setUserRole('doctor');
-            }
-          });
-
-          return () => subscription.unsubscribe();
-        } else {
-          // In local Excel mode, keep session null until user clicks bypass
-          setStats(prev => ({ 
-            ...prev, 
-            dbEngine: 'Local Microsoft Excel Worksheet' 
-          }));
-        }
+        // Immediately update stats.dbEngine from the public status endpoint
+        setStats(prev => ({ ...prev, dbEngine: data.dbEngine }));
       })
       .catch(err => {
         console.error('Failed to load DB status:', err);
         setDbStatus({ isPostgres: false, dbEngine: 'Local Microsoft Excel Worksheet' });
       });
+
+    // Set up Supabase auth listener
+    if (supabase) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        setSession(session);
+        if (session) {
+          fetchUserProfile(session.user);
+        }
+      });
+
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
+        setSession(currentSession);
+        if (currentSession) {
+          fetchUserProfile(currentSession.user);
+        } else {
+          setUserRole('doctor');
+        }
+      });
+
+      return () => subscription.unsubscribe();
+    }
   }, []);
 
   // Authenticated Fetch wrapper helper
@@ -105,16 +102,10 @@ function App() {
     if (session && session.access_token) {
       headers['Authorization'] = `Bearer ${session.access_token}`;
     }
-    const res = await fetch(url, {
+    return fetch(url, {
       ...options,
       headers
     });
-    
-    if (res.status === 401) {
-      console.warn('[Session] Session expired or invalid. Logging out.');
-      handleLogout();
-    }
-    return res;
   };
 
   const fetchStats = async () => {
@@ -123,7 +114,8 @@ function App() {
       const res = await authFetch('/api/stats');
       if (res.ok) {
         const data = await res.json();
-        setStats(data);
+        // Always preserve dbEngine from the public status endpoint
+        setStats(prev => ({ ...data, dbEngine: prev.dbEngine || data.dbEngine }));
       }
     } catch (err) {
       console.error('Error fetching statistics:', err);
@@ -205,8 +197,17 @@ function App() {
     }
   };
 
-  // If no auth session, render Login Portal
+  // Wait for backend status check before rendering login
   if (!session) {
+    if (dbStatus.isPostgres === null) {
+      // Still loading status from backend
+      return (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
+          <p style={{ fontSize: '1.1rem', opacity: 0.7 }}>Connecting to database...</p>
+        </div>
+      );
+    }
+
     return (
       <Login 
         supabase={dbStatus.isPostgres ? supabase : null} 
