@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
-import { Database, FileSpreadsheet, Download, RefreshCw, AlertTriangle, ShieldCheck, HelpCircle } from 'lucide-react';
+import { Database, Cloud, HardDrive, Download, RefreshCw, ShieldCheck, Info } from 'lucide-react';
 
-function ExcelManager({ stats, onStatsChange, session }) {
+function ExcelManager({ stats, dbStatus, onStatsChange, session }) {
   const [downloading, setDownloading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+
+  const isSheets = dbStatus?.dbEngine === 'sheets';
+  const isDrive = dbStatus?.storageEngine === 'drive';
 
   const handleManualRefresh = async () => {
     setRefreshing(true);
@@ -11,16 +14,12 @@ function ExcelManager({ stats, onStatsChange, session }) {
     setTimeout(() => setRefreshing(false), 800);
   };
 
-  const handleBackupDownload = async () => {
+  const handleBackupDownload = () => {
     setDownloading(true);
     try {
-      // Trigger native browser download for Excel sheet with session token
       const token = session?.access_token;
       const downloadUrl = token ? `/api/database/backup?token=${token}` : '/api/database/backup';
       window.open(downloadUrl, '_blank');
-    } catch (e) {
-      console.error(e);
-      alert('Failed to initiate backup download.');
     } finally {
       setDownloading(false);
     }
@@ -28,144 +27,116 @@ function ExcelManager({ stats, onStatsChange, session }) {
 
   return (
     <>
-      {/* Header */}
       <div className="content-header">
         <div className="header-title-section">
-          <h2>Excel Database Management</h2>
-          <p>Inspect database configuration, connection logs, and download spreadsheet backups</p>
+          <h2>Database & Storage</h2>
+          <p>Current database and file storage engine, and backup tools</p>
         </div>
         <div className="header-action-section">
           <button className="btn btn-outline" onClick={handleManualRefresh} disabled={refreshing}>
             <RefreshCw size={16} className={refreshing ? 'spin-animation' : ''} />
-            Test Connection
+            Refresh
           </button>
         </div>
       </div>
 
       {/* Connection status */}
-      <div 
-        className="sync-status-indicator" 
-        style={stats.dbEngine?.includes('PostgreSQL') ? { backgroundColor: 'var(--success-light)', borderColor: 'rgba(16, 185, 129, 0.15)', color: 'var(--success)' } : {}}
+      <div
+        className="sync-status-indicator"
+        style={isSheets ? { backgroundColor: 'var(--success-light)', borderColor: 'rgba(16, 185, 129, 0.15)', color: 'var(--success)' } : {}}
       >
         <ShieldCheck size={26} />
         <div>
           <strong style={{ fontSize: '1.05rem' }}>
-            {stats.dbEngine?.includes('PostgreSQL') ? 'Active Supabase Cloud Database Connected' : 'Active Local Connection Established'}
+            {isSheets ? 'Connected to Google Sheets' : 'Using Local Excel Fallback'}
           </strong>
           <p style={{ fontSize: '0.85rem', marginTop: '2px', opacity: 0.9 }}>
-            {stats.dbEngine?.includes('PostgreSQL') 
-              ? 'The Node server is reading and writing to your Supabase PostgreSQL cloud database in real-time over TLS.' 
-              : 'The Node server is reading and writing to your local Excel sheet file in real-time.'}
+            {isSheets
+              ? 'Patient and visit records are read from and written to a Google Sheets spreadsheet in real time.'
+              : 'GOOGLE_SHEETS_ID or GOOGLE_SERVICE_ACCOUNT_KEY is not set (or unreachable) — using the local Excel workbook instead.'}
           </p>
         </div>
       </div>
 
-      {/* Database Properties Card */}
-      <div className="card excel-sync-card">
-        <h3 style={{ fontSize: '1.15rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <Database size={20} style={{ color: 'var(--primary)' }} />
-          Database Properties & Connection Details
-        </h3>
-        
-        <table className="sync-details-table">
-          <tbody>
-            <tr>
-              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Database Type' : 'File Name'}</td>
-              <td className="value-cell" style={{ fontFamily: 'inherit', fontWeight: 500 }}>
-                {stats.dbEngine?.includes('PostgreSQL') ? 'Supabase cloud-hosted PostgreSQL' : 'popms_database.xlsx'}
-              </td>
-            </tr>
-            <tr>
-              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Connection URI' : 'Absolute Path'}</td>
-              <td className="value-cell">
-                {stats.excelPath || 'c:\\Users\\FRACTAL\\Desktop\\Kings PMS\\popms_database.xlsx'}
-              </td>
-            </tr>
-            <tr>
-              <td className="label-cell">Database Engine</td>
-              <td className="value-cell" style={{ fontFamily: 'inherit' }}>
-                {stats.dbEngine || 'Node.js ExcelJS Engine (Thread-Safe Reads/Writes)'}
-              </td>
-            </tr>
-            <tr>
-              <td className="label-cell">{stats.dbEngine?.includes('PostgreSQL') ? 'Target Tables' : 'Target Sheets'}</td>
-              <td className="value-cell" style={{ fontFamily: 'inherit' }}>
-                {stats.dbEngine?.includes('PostgreSQL') ? (
-                  <>
-                    <code>patients</code> (Demographics Table) <br/>
-                    <code>visits</code> (Clinical History & Media Table)
-                  </>
-                ) : (
-                  <>
-                    <code>Patients</code> (Registered Profile Records) <br/>
-                    <code>Visits</code> (Consultation History & Media Logs)
-                  </>
-                )}
-              </td>
-            </tr>
-            <tr>
-              <td className="label-cell">Current Records Size</td>
-              <td className="value-cell" style={{ fontFamily: 'inherit' }}>
-                <strong>{stats.totalPatients}</strong> registered patients in database
-              </td>
-            </tr>
-          </tbody>
-        </table>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px' }}>
+        {/* Database Engine Card */}
+        <div className="card">
+          <h3 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Database size={18} style={{ color: 'var(--primary)' }} />
+            Database Engine
+          </h3>
+          <table className="sync-details-table">
+            <tbody>
+              <tr>
+                <td className="label-cell">Engine</td>
+                <td className="value-cell">{dbStatus?.dbEngineLabel || stats.dbEngineLabel}</td>
+              </tr>
+              <tr>
+                <td className="label-cell">{isSheets ? 'Sheet Tabs' : 'Worksheets'}</td>
+                <td className="value-cell">
+                  <code>Patients</code>, <code>Visits</code>, <code>Profiles</code>
+                </td>
+              </tr>
+              <tr>
+                <td className="label-cell">Records</td>
+                <td className="value-cell"><strong>{stats.totalPatients}</strong> registered patients</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
 
-        {/* Database Download Action */}
+        {/* File Storage Card */}
+        <div className="card">
+          <h3 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {isDrive ? <Cloud size={18} style={{ color: 'var(--primary)' }} /> : <HardDrive size={18} style={{ color: 'var(--primary)' }} />}
+            File Storage
+          </h3>
+          <table className="sync-details-table">
+            <tbody>
+              <tr>
+                <td className="label-cell">Engine</td>
+                <td className="value-cell">{dbStatus?.storageEngineLabel}</td>
+              </tr>
+              <tr>
+                <td className="label-cell">Uploaded media</td>
+                <td className="value-cell">
+                  {isDrive ? 'Stored in the configured Google Drive folder.' : 'Stored locally in the uploads/ folder.'}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Backup */}
+      <div className="card excel-sync-card">
+        <h3 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <Download size={18} style={{ color: 'var(--primary)' }} />
+          Spreadsheet Backup
+        </h3>
         <div style={{ display: 'flex', gap: '16px', alignItems: 'center', marginTop: '8px', flexWrap: 'wrap' }}>
           <button className="btn btn-primary" onClick={handleBackupDownload} disabled={downloading}>
             <Download size={18} />
             Download Spreadsheet (.xlsx)
           </button>
-          
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            {stats.dbEngine?.includes('PostgreSQL')
-              ? 'Compiles the live Supabase PostgreSQL relational database tables into a structured Excel workbook (.xlsx) download on-the-fly.'
-              : 'Downloads the raw Excel workbook file directly for manual reviews or custom reports.'}
+            Generates a fresh .xlsx snapshot of all current records.
           </span>
         </div>
       </div>
 
-      {/* Pediatric Clinical Notice / Instructions */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px' }}>
-        
-        {/* Safe Operations Card */}
+      {!isSheets && (
         <div className="card" style={{ borderLeft: '4px solid var(--warning)' }}>
-          <h4 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-            <AlertTriangle size={18} style={{ color: 'var(--warning)' }} />
-            Preventing File Lock Issues
+          <h4 style={{ fontSize: '1rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+            <Info size={16} style={{ color: 'var(--warning)' }} />
+            Enable Google Sheets & Drive
           </h4>
-          <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: '1.6' }}>
-            Because this application uses a local Excel spreadsheet as its database, <strong>opening the Excel file in Microsoft Excel or another viewer while the server is saving data can cause lock conflicts</strong>. 
-            <br/><br/>
-            To prevent failures:
-            <ul style={{ paddingLeft: '20px', marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <li>Close the Excel spreadsheet before submitting new registrations or consultations.</li>
-              <li>If the database locks, restart the Node.js console window and refresh the browser tab.</li>
-            </ul>
+          <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: '1.6' }}>
+            Set <code>GOOGLE_SERVICE_ACCOUNT_KEY</code>, <code>GOOGLE_SHEETS_ID</code> and <code>GOOGLE_DRIVE_FOLDER_ID</code> in your environment,
+            then share the spreadsheet and Drive folder with the service account's <code>client_email</code> as an Editor. See <code>.env.example</code> for details.
           </p>
         </div>
-
-        {/* Future SQL Migration */}
-        <div className="card" style={{ borderLeft: '4px solid var(--primary)' }}>
-          <h4 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-            <HelpCircle size={18} style={{ color: 'var(--primary)' }} />
-            SQL Database Integration
-          </h4>
-          <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: '1.6' }}>
-            This system was architected with a decoupled REST API abstraction layer. All read/write operations occur through standardized controllers.
-            <br/><br/>
-            When ready to transition from **Excel Sheets** to a production-ready SQL database (like **PostgreSQL**, **MySQL**, or **SQLite**):
-            <ul style={{ paddingLeft: '20px', marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <li>Swap the database helper module in <code>server.js</code> with an ORM (e.g. Prisma, Sequelize).</li>
-              <li>No alterations will be required on the React frontend components.</li>
-              <li>We can run a database seeding script to parse your existing Excel spreadsheet and load records into the SQL tables.</li>
-            </ul>
-          </p>
-        </div>
-
-      </div>
+      )}
     </>
   );
 }

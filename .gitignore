@@ -13,6 +13,12 @@ dist/
 *.xlsx
 uploads/
 
+# Google service account credential keys
+service-account*.json
+*-service-account.json
+service_acc*.json
+google-credentials*.json
+
 # System files
 .DS_Store
 Thumbs.db

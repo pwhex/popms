@@ -3,14 +3,16 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import exceljs from 'exceljs';
+import jwt from 'jsonwebtoken';
+import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import pg from 'pg';
-import { createClient } from '@supabase/supabase-js';
+import { google } from 'googleapis';
+import { OAuth2Client } from 'google-auth-library';
 
 dotenv.config();
-const { Pool } = pg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,47 +23,33 @@ const PORT = 5000;
 app.use(cors());
 app.use(express.json());
 
-// Setup local media directories
+// Setup local media directory (used when Google Drive storage is not configured)
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Excel Database Path (Fallback/PoC only)
+// Excel Database Path (fallback when Google Sheets is not configured)
 const DB_FILE = path.join(__dirname, 'popms_database.xlsx');
 
-// Configure Storage for Multer (file upload)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage });
+// Shared table schema, used by both the Excel and Google Sheets backends
+const TABLE_SCHEMAS = {
+  Patients: ['out_patient_id', 'patient_name', 'mobile', 'dob', 'gender', 'hospital', 'unit', 'main_diagnosis', 'registered_date'],
+  Visits: ['visit_id', 'out_patient_id', 'visit_date', 'visit_type', 'height_cm', 'weight_kg', 'affected_side', 'clinical_notes', 'diagnosis', 'treatment_plan', 'media_urls', 'follow_up_date', 'follow_up_status'],
+  Profiles: ['id', 'email', 'role', 'created_at']
+};
 
-// Database Connection States
-let isPostgres = false;
-let pgPool = null;
-let supabase = null;
+const COLUMN_WIDTHS = {
+  out_patient_id: 15, patient_name: 25, mobile: 18, dob: 12, gender: 10, hospital: 20, unit: 25, main_diagnosis: 35, registered_date: 15,
+  visit_id: 15, visit_date: 12, visit_type: 15, height_cm: 12, weight_kg: 12, affected_side: 15, clinical_notes: 50, diagnosis: 35, treatment_plan: 35, media_urls: 40, follow_up_date: 15, follow_up_status: 15,
+  id: 30, email: 30, role: 12, created_at: 15
+};
 
-// Initialize Supabase Client if env is provided
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
-
-if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-}
-
-// Date Formatter Helper
-const formatDate = (dateVal) => {
-  if (!dateVal) return '';
-  const d = new Date(dateVal);
-  if (isNaN(d.getTime())) return String(dateVal);
-  return d.toISOString().split('T')[0];
+const SHEET_HEADER_COLORS = {
+  Patients: 'FF1E3A8A',
+  Visits: 'FF0D9488',
+  Profiles: 'FF7C3AED'
 };
 
 // Seed Mock Data Definitions
@@ -239,14 +227,297 @@ const mockVisits = [
   }
 ];
 
-// JWT Session Authentication Middleware
-const authenticateJWT = async (req, res, next) => {
-  if (!isPostgres) {
-    // Excel offline mode bypasses Supabase JWT token verification
-    req.user = { id: 'local-poc-id', email: 'doctor@popms.com', role: 'admin' };
-    return next();
+// ── Google API client setup ──────────────────────────────────────────────
+
+function loadServiceAccountCredentials() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const filePath = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE;
+  if (raw) {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      console.error('[Google] GOOGLE_SERVICE_ACCOUNT_KEY is not valid JSON:', err.message);
+      return null;
+    }
+  }
+  if (filePath && fs.existsSync(filePath)) {
+    try {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    } catch (err) {
+      console.error('[Google] Failed to read GOOGLE_SERVICE_ACCOUNT_KEY_FILE:', err.message);
+      return null;
+    }
+  }
+  return null;
+}
+
+const serviceAccountCreds = loadServiceAccountCredentials();
+let sheetsApi = null;
+let driveApi = null;
+
+if (serviceAccountCreds) {
+  const googleAuth = new google.auth.GoogleAuth({
+    credentials: serviceAccountCreds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+  });
+  sheetsApi = google.sheets({ version: 'v4', auth: googleAuth });
+  driveApi = google.drive({ version: 'v3', auth: googleAuth });
+}
+
+const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID || null;
+const googleOAuthClient = GOOGLE_OAUTH_CLIENT_ID ? new OAuth2Client(GOOGLE_OAUTH_CLIENT_ID) : null;
+
+// ── Session signing ───────────────────────────────────────────────────────
+
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.SESSION_SECRET) {
+  console.warn('[Auth] SESSION_SECRET is not set — using a temporary secret for this run. All sessions will be invalidated on restart. Set SESSION_SECRET in .env for persistent sessions.');
+}
+
+// ── Excel backend (fallback database) ───────────────────────────────────
+
+function createExcelBackend(dbFile) {
+  async function initialize() {
+    if (fs.existsSync(dbFile)) return;
+
+    const workbook = new exceljs.Workbook();
+    for (const table of Object.keys(TABLE_SCHEMAS)) {
+      const sheet = workbook.addWorksheet(table);
+      sheet.columns = TABLE_SCHEMAS[table].map(col => ({ header: col, key: col, width: COLUMN_WIDTHS[col] || 20 }));
+      sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SHEET_HEADER_COLORS[table] } };
+    }
+    mockPatients.forEach(p => workbook.getWorksheet('Patients').addRow(p));
+    mockVisits.forEach(v => workbook.getWorksheet('Visits').addRow(v));
+
+    await workbook.xlsx.writeFile(dbFile);
   }
 
+  async function list(table) {
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.readFile(dbFile);
+    const worksheet = workbook.getWorksheet(table);
+    const headers = [];
+    const rows = [];
+
+    worksheet.getRow(1).eachCell((cell, colNumber) => {
+      headers[colNumber] = cell.value;
+    });
+
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      const rowObject = {};
+      headers.forEach((header, colNumber) => {
+        let cellValue = row.getCell(colNumber).value;
+        if (cellValue && typeof cellValue === 'object') {
+          if (cellValue.text) cellValue = cellValue.text;
+          else if (cellValue.result !== undefined) cellValue = cellValue.result;
+        }
+        rowObject[header] = cellValue === null || cellValue === undefined ? '' : cellValue;
+      });
+      rows.push(rowObject);
+    });
+    return rows;
+  }
+
+  async function insert(table, dataObject) {
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.readFile(dbFile);
+    const worksheet = workbook.getWorksheet(table);
+    const headers = [];
+    worksheet.getRow(1).eachCell((cell, colNumber) => {
+      headers[colNumber] = cell.value;
+    });
+
+    const rowValues = [];
+    headers.forEach((header, colNumber) => {
+      rowValues[colNumber] = dataObject[header] !== undefined && dataObject[header] !== null ? dataObject[header] : '';
+    });
+    worksheet.addRow(rowValues);
+    await workbook.xlsx.writeFile(dbFile);
+  }
+
+  async function update(table, keyColName, keyValue, updateData) {
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.readFile(dbFile);
+    const worksheet = workbook.getWorksheet(table);
+    const headers = [];
+    worksheet.getRow(1).eachCell((cell, colNumber) => {
+      headers[colNumber] = cell.value;
+    });
+
+    const keyColIdx = headers.indexOf(keyColName);
+    if (keyColIdx === -1) {
+      throw new Error(`Key column '${keyColName}' not found in sheet '${table}'`);
+    }
+
+    let updated = false;
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      const currentVal = row.getCell(keyColIdx).value;
+      if (String(currentVal) === String(keyValue)) {
+        headers.forEach((header, colIdx) => {
+          if (updateData[header] !== undefined) {
+            row.getCell(colIdx).value = updateData[header];
+          }
+        });
+        updated = true;
+      }
+    });
+
+    if (!updated) {
+      throw new Error(`Row with ${keyColName}=${keyValue} not found in ${table}`);
+    }
+    await workbook.xlsx.writeFile(dbFile);
+  }
+
+  return { type: 'excel', initialize, list, insert, update };
+}
+
+// ── Google Sheets backend ─────────────────────────────────────────────────
+
+function columnLetter(index) {
+  let letter = '';
+  let n = index + 1;
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    letter = String.fromCharCode(65 + rem) + letter;
+    n = Math.floor((n - 1) / 26);
+  }
+  return letter;
+}
+
+function createSheetsBackend(spreadsheetId) {
+  async function ensureSheet(table) {
+    const meta = await sheetsApi.spreadsheets.get({ spreadsheetId });
+    const existingTitles = meta.data.sheets.map(s => s.properties.title);
+    if (!existingTitles.includes(table)) {
+      await sheetsApi.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: [{ addSheet: { properties: { title: table } } }] }
+      });
+    }
+    const header = TABLE_SCHEMAS[table];
+    const lastCol = columnLetter(header.length - 1);
+    await sheetsApi.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${table}!A1:${lastCol}1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [header] }
+    });
+  }
+
+  async function initialize() {
+    await sheetsApi.spreadsheets.get({ spreadsheetId });
+    for (const table of Object.keys(TABLE_SCHEMAS)) {
+      await ensureSheet(table);
+    }
+    const patients = await list('Patients');
+    if (patients.length === 0) {
+      for (const p of mockPatients) await insert('Patients', p);
+      for (const v of mockVisits) await insert('Visits', v);
+    }
+  }
+
+  async function list(table) {
+    const header = TABLE_SCHEMAS[table];
+    const lastCol = columnLetter(header.length - 1);
+    const res = await sheetsApi.spreadsheets.values.get({ spreadsheetId, range: `${table}!A2:${lastCol}20000` });
+    const rows = res.data.values || [];
+    return rows.filter(r => r.length > 0).map(row => {
+      const obj = {};
+      header.forEach((h, i) => { obj[h] = row[i] !== undefined ? row[i] : ''; });
+      return obj;
+    });
+  }
+
+  async function insert(table, dataObject) {
+    const header = TABLE_SCHEMAS[table];
+    const rowValues = header.map(h => (dataObject[h] !== undefined && dataObject[h] !== null ? dataObject[h] : ''));
+    await sheetsApi.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${table}!A1`,
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [rowValues] }
+    });
+  }
+
+  async function update(table, keyColName, keyValue, updateData) {
+    const header = TABLE_SCHEMAS[table];
+    const keyIdx = header.indexOf(keyColName);
+    const lastCol = columnLetter(header.length - 1);
+    const res = await sheetsApi.spreadsheets.values.get({ spreadsheetId, range: `${table}!A2:${lastCol}20000` });
+    const rows = res.data.values || [];
+    const rowIdx = rows.findIndex(r => String(r[keyIdx]) === String(keyValue));
+    if (rowIdx === -1) {
+      throw new Error(`Row with ${keyColName}=${keyValue} not found in ${table}`);
+    }
+    const existing = rows[rowIdx];
+    const merged = header.map((h, i) => (updateData[h] !== undefined ? updateData[h] : (existing[i] !== undefined ? existing[i] : '')));
+    const sheetRowNumber = rowIdx + 2;
+    await sheetsApi.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${table}!A${sheetRowNumber}:${lastCol}${sheetRowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [merged] }
+    });
+  }
+
+  return { type: 'sheets', initialize, list, insert, update };
+}
+
+// ── Engine state (resolved at boot) ────────────────────────────────────────
+
+let db = null;
+let dbEngine = 'excel';
+let storageEngine = 'local';
+
+// ── Auth ────────────────────────────────────────────────────────────────
+
+function signSession(profile) {
+  const token = jwt.sign({ sub: profile.id, email: profile.email, role: profile.role }, SESSION_SECRET, { expiresIn: '7d' });
+  return { access_token: token, user: { id: profile.id, email: profile.email }, role: profile.role };
+}
+
+async function resolveProfile(id, email) {
+  const profiles = await db.list('Profiles');
+  const existing = profiles.find(p => p.id === id);
+  if (existing) {
+    return { id, email: existing.email || email, role: existing.role || 'doctor' };
+  }
+  const role = profiles.length === 0 ? 'admin' : 'doctor';
+  await db.insert('Profiles', { id, email, role, created_at: new Date().toISOString().split('T')[0] });
+  return { id, email, role };
+}
+
+app.post('/api/auth/bypass', async (req, res) => {
+  try {
+    const profile = await resolveProfile('local-poc-id', 'doctor@popms.com');
+    res.json(signSession(profile));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to start local session.' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  if (!googleOAuthClient) {
+    return res.status(400).json({ error: 'Google Sign-In is not configured on this server.' });
+  }
+  try {
+    const { credential } = req.body;
+    const ticket = await googleOAuthClient.verifyIdToken({ idToken: credential, audience: GOOGLE_OAUTH_CLIENT_ID });
+    const payload = ticket.getPayload();
+    const profile = await resolveProfile(payload.sub, payload.email);
+    res.json(signSession(profile));
+  } catch (error) {
+    console.error('[Auth] Google sign-in failed:', error.message);
+    res.status(401).json({ error: 'Google sign-in verification failed.' });
+  }
+});
+
+const authenticateJWT = (req, res, next) => {
   let token = null;
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -259,41 +530,14 @@ const authenticateJWT = async (req, res, next) => {
     return res.status(401).json({ error: 'Authorization token is missing or invalid.' });
   }
   try {
-    if (!supabase) {
-      return res.status(500).json({ error: 'Supabase client is not configured on the backend.' });
-    }
-    
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    
-    if (error || !user) {
-      return res.status(401).json({ error: 'Invalid or expired session token.' });
-    }
-
-    // Query local profiles table for user role
-    const profileResult = await pgPool.query('SELECT role FROM profiles WHERE id = $1', [user.id]);
-    
-    // Default to doctor if no profile row yet
-    let role = 'doctor';
-    if (profileResult.rows.length > 0) {
-      role = profileResult.rows[0].role;
-    } else {
-      // Create profile row if it doesn't exist (failsafe)
-      await pgPool.query('INSERT INTO profiles (id, email, role) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [user.id, user.email, 'doctor']);
-    }
-
-    req.user = {
-      id: user.id,
-      email: user.email,
-      role: role
-    };
+    const payload = jwt.verify(token, SESSION_SECRET);
+    req.user = { id: payload.sub, email: payload.email, role: payload.role };
     next();
   } catch (err) {
-    console.error('[Auth] Verification failed:', err.message);
-    return res.status(401).json({ error: 'Session authentication failed.' });
+    return res.status(401).json({ error: 'Invalid or expired session token.' });
   }
 };
 
-// Admin Protection Middleware
 const requireAdmin = (req, res, next) => {
   if (req.user && req.user.role === 'admin') {
     next();
@@ -302,313 +546,65 @@ const requireAdmin = (req, res, next) => {
   }
 };
 
-// PostgreSQL Database Initializer
-async function initializePostgres() {
-  const client = await pgPool.connect();
+// ── File upload (Google Drive, falls back to local disk) ─────────────────
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+app.post('/api/upload', authenticateJWT, upload.single('media'), async (req, res) => {
   try {
-    console.log('[Database] Checking / creating relational tables in Supabase PGSQL...');
-    
-    // Create profiles table (links to auth.users)
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.profiles (
-        id UUID PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        role VARCHAR(50) DEFAULT 'doctor',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
-      );
-    `);
-
-    // Create Patients table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS patients (
-        out_patient_id VARCHAR(50) PRIMARY KEY,
-        patient_name VARCHAR(100) NOT NULL,
-        mobile VARCHAR(50),
-        dob DATE NOT NULL,
-        gender VARCHAR(20) NOT NULL,
-        hospital VARCHAR(100) NOT NULL,
-        unit VARCHAR(100) NOT NULL,
-        main_diagnosis TEXT NOT NULL,
-        registered_date DATE DEFAULT CURRENT_DATE
-      );
-    `);
-
-    // Create Visits table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS visits (
-        visit_id VARCHAR(50) PRIMARY KEY,
-        out_patient_id VARCHAR(50) REFERENCES patients(out_patient_id) ON DELETE CASCADE,
-        visit_date DATE DEFAULT CURRENT_DATE,
-        visit_type VARCHAR(50) NOT NULL,
-        height_cm NUMERIC(5,2),
-        weight_kg NUMERIC(5,2),
-        affected_side VARCHAR(50),
-        clinical_notes TEXT NOT NULL,
-        diagnosis TEXT NOT NULL,
-        treatment_plan TEXT,
-        media_urls TEXT,
-        follow_up_date DATE,
-        follow_up_status VARCHAR(50)
-      );
-    `);
-
-    // Create Database Triggers to automatically link profiles
-    console.log('[Database] Syncing authentication trigger in schema auth...');
-    await client.query(`
-      CREATE OR REPLACE FUNCTION public.handle_new_user()
-      RETURNS trigger AS $$
-      DECLARE
-        admin_count integer;
-      BEGIN
-        -- If this is the absolute first user, promote them to admin
-        SELECT COUNT(*) INTO admin_count FROM public.profiles WHERE role = 'admin';
-        IF admin_count = 0 THEN
-          INSERT INTO public.profiles (id, email, role)
-          VALUES (new.id, new.email, 'admin')
-          ON CONFLICT (id) DO NOTHING;
-        ELSE
-          INSERT INTO public.profiles (id, email, role)
-          VALUES (new.id, new.email, 'doctor')
-          ON CONFLICT (id) DO NOTHING;
-        END IF;
-        RETURN new;
-      END;
-      $$ LANGUAGE plpgsql SECURITY DEFINER;
-    `);
-
-    await client.query(`
-      DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-    `);
-    
-    await client.query(`
-      CREATE TRIGGER on_auth_user_created
-        AFTER INSERT ON auth.users
-        FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
-    `);
-
-    // Seed Patients if empty
-    const checkPatients = await client.query('SELECT COUNT(*) FROM patients');
-    if (parseInt(checkPatients.rows[0].count) === 0) {
-      console.log('[Database] Seeding mock patients into Supabase...');
-      for (const p of mockPatients) {
-        await client.query(`
-          INSERT INTO patients (out_patient_id, patient_name, mobile, dob, gender, hospital, unit, main_diagnosis, registered_date)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [p.out_patient_id, p.patient_name, p.mobile, p.dob, p.gender, p.hospital, p.unit, p.main_diagnosis, p.registered_date]);
-      }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded.' });
     }
 
-    // Seed Visits if empty
-    const checkVisits = await client.query('SELECT COUNT(*) FROM visits');
-    if (parseInt(checkVisits.rows[0].count) === 0) {
-      console.log('[Database] Seeding mock visit logs into Supabase...');
-      for (const v of mockVisits) {
-        await client.query(`
-          INSERT INTO visits (visit_id, out_patient_id, visit_date, visit_type, height_cm, weight_kg, affected_side, clinical_notes, diagnosis, treatment_plan, media_urls, follow_up_date, follow_up_status)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        `, [
-          v.visit_id, v.out_patient_id, v.visit_date, v.visit_type,
-          v.height_cm ? Number(v.height_cm) : null,
-          v.weight_kg ? Number(v.weight_kg) : null,
-          v.affected_side, v.clinical_notes, v.diagnosis, v.treatment_plan, v.media_urls,
-          v.follow_up_date || null, v.follow_up_status || null
-        ]);
-      }
-    }
-
-    console.log('[Database] Supabase SQL Database initialized successfully!');
-  } finally {
-    client.release();
-  }
-}
-
-// Fallback Excel Database Initializer
-async function initializeExcelDatabase() {
-  if (fs.existsSync(DB_FILE)) {
-    console.log(`[Database] Excel fallback database verified at ${DB_FILE}`);
-    return;
-  }
-
-  console.log('[Database] Excel database not found. Initializing a new template on disk...');
-  const workbook = new exceljs.Workbook();
-  
-  const patientsSheet = workbook.addWorksheet('Patients');
-  patientsSheet.columns = [
-    { header: 'out_patient_id', key: 'out_patient_id', width: 15 },
-    { header: 'patient_name', key: 'patient_name', width: 25 },
-    { header: 'mobile', key: 'mobile', width: 18 },
-    { header: 'dob', key: 'dob', width: 12 },
-    { header: 'gender', key: 'gender', width: 10 },
-    { header: 'hospital', key: 'hospital', width: 20 },
-    { header: 'unit', key: 'unit', width: 25 },
-    { header: 'main_diagnosis', key: 'main_diagnosis', width: 35 },
-    { header: 'registered_date', key: 'registered_date', width: 15 }
-  ];
-
-  patientsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  patientsSheet.getRow(1).fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FF1E3A8A' }
-  };
-  mockPatients.forEach(p => patientsSheet.addRow(p));
-
-  const visitsSheet = workbook.addWorksheet('Visits');
-  visitsSheet.columns = [
-    { header: 'visit_id', key: 'visit_id', width: 15 },
-    { header: 'out_patient_id', key: 'out_patient_id', width: 15 },
-    { header: 'visit_date', key: 'visit_date', width: 12 },
-    { header: 'visit_type', key: 'visit_type', width: 15 },
-    { header: 'height_cm', key: 'height_cm', width: 12 },
-    { header: 'weight_kg', key: 'weight_kg', width: 12 },
-    { header: 'affected_side', key: 'affected_side', width: 15 },
-    { header: 'clinical_notes', key: 'clinical_notes', width: 50 },
-    { header: 'diagnosis', key: 'diagnosis', width: 35 },
-    { header: 'treatment_plan', key: 'treatment_plan', width: 35 },
-    { header: 'media_urls', key: 'media_urls', width: 40 },
-    { header: 'follow_up_date', key: 'follow_up_date', width: 15 },
-    { header: 'follow_up_status', key: 'follow_up_status', width: 15 }
-  ];
-
-  visitsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  visitsSheet.getRow(1).fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FF0D9488' }
-  };
-  mockVisits.forEach(v => visitsSheet.addRow(v));
-
-  await workbook.xlsx.writeFile(DB_FILE);
-  console.log(`[Database] Fallback Excel Database created successfully with mock data.`);
-}
-
-// Helper to read Excel Worksheet rows
-async function readExcelSheet(sheetName) {
-  const workbook = new exceljs.Workbook();
-  await workbook.xlsx.readFile(DB_FILE);
-  const worksheet = workbook.getWorksheet(sheetName);
-  const headers = [];
-  const rows = [];
-  
-  worksheet.getRow(1).eachCell((cell, colNumber) => {
-    headers[colNumber] = cell.value;
-  });
-  
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const rowObject = {};
-    headers.forEach((header, colNumber) => {
-      let cellValue = row.getCell(colNumber).value;
-      if (cellValue && typeof cellValue === 'object') {
-        if (cellValue.text) cellValue = cellValue.text;
-        else if (cellValue.result !== undefined) cellValue = cellValue.result;
-      }
-      rowObject[header] = cellValue === null || cellValue === undefined ? '' : cellValue;
-    });
-    rows.push(rowObject);
-  });
-  return rows;
-}
-
-// Helper to append Excel Worksheet row
-async function appendExcelRow(sheetName, dataObject) {
-  const workbook = new exceljs.Workbook();
-  await workbook.xlsx.readFile(DB_FILE);
-  const worksheet = workbook.getWorksheet(sheetName);
-  const headers = [];
-  worksheet.getRow(1).eachCell((cell, colNumber) => {
-    headers[colNumber] = cell.value;
-  });
-  
-  const rowValues = [];
-  headers.forEach((header, colNumber) => {
-    rowValues[colNumber] = dataObject[header] !== undefined && dataObject[header] !== null 
-      ? dataObject[header] 
-      : '';
-  });
-  worksheet.addRow(rowValues);
-  await workbook.xlsx.writeFile(DB_FILE);
-}
-
-// Helper to update Excel Worksheet row
-async function updateExcelRow(sheetName, keyColName, keyValue, updateData) {
-  const workbook = new exceljs.Workbook();
-  await workbook.xlsx.readFile(DB_FILE);
-  const worksheet = workbook.getWorksheet(sheetName);
-  const headers = [];
-  worksheet.getRow(1).eachCell((cell, colNumber) => {
-    headers[colNumber] = cell.value;
-  });
-  
-  const keyColIdx = headers.indexOf(keyColName);
-  if (keyColIdx === -1) {
-    throw new Error(`Key column '${keyColName}' not found in sheet '${sheetName}'`);
-  }
-  
-  let updated = false;
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const currentVal = row.getCell(keyColIdx).value;
-    if (String(currentVal) === String(keyValue)) {
-      headers.forEach((header, colIdx) => {
-        if (updateData[header] !== undefined) {
-          row.getCell(colIdx).value = updateData[header];
-        }
+    if (storageEngine === 'drive') {
+      const filename = `${Date.now()}-${req.file.originalname}`;
+      const driveRes = await driveApi.files.create({
+        requestBody: { name: filename, parents: [process.env.GOOGLE_DRIVE_FOLDER_ID] },
+        media: { mimeType: req.file.mimetype, body: Readable.from(req.file.buffer) },
+        fields: 'id, webViewLink'
       });
-      updated = true;
+      await driveApi.permissions.create({
+        fileId: driveRes.data.id,
+        requestBody: { role: 'reader', type: 'anyone' }
+      });
+      res.json({ url: driveRes.data.webViewLink, filename });
+    } else {
+      const filename = `media-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(req.file.originalname)}`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), req.file.buffer);
+      res.json({ url: `/uploads/${filename}`, filename });
     }
-  });
-  
-  if (!updated) {
-    throw new Error(`Row with ${keyColName}=${keyValue} not found in ${sheetName}`);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'File upload failed.' });
   }
-  await workbook.xlsx.writeFile(DB_FILE);
-}
+});
 
-// API: Get all patients
+// ── API: Patients & Visits ────────────────────────────────────────────────
+
 app.get('/api/patients', authenticateJWT, async (req, res) => {
   try {
-    if (isPostgres) {
-      const result = await pgPool.query('SELECT * FROM patients ORDER BY registered_date DESC');
-      const formatted = result.rows.map(r => ({
-        ...r,
-        dob: formatDate(r.dob),
-        registered_date: formatDate(r.registered_date)
-      }));
-      res.json(formatted);
-    } else {
-      const patients = await readExcelSheet('Patients');
-      res.json(patients);
-    }
+    const patients = await db.list('Patients');
+    patients.sort((a, b) => new Date(b.registered_date) - new Date(a.registered_date));
+    res.json(patients);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to retrieve patients from database.' });
   }
 });
 
-// API: Register a new patient
 app.post('/api/patients', authenticateJWT, async (req, res) => {
   try {
     const { out_patient_id, patient_name, mobile, dob, gender, hospital, unit, main_diagnosis } = req.body;
-    
+
     if (!out_patient_id || !patient_name || !dob || !gender || !main_diagnosis) {
       return res.status(400).json({ error: 'Missing required registration fields.' });
     }
-    
-    // Check duplication
-    let existing = null;
-    if (isPostgres) {
-      const result = await pgPool.query('SELECT * FROM patients WHERE out_patient_id = $1', [out_patient_id]);
-      if (result.rows.length > 0) existing = result.rows[0];
-    } else {
-      const patients = await readExcelSheet('Patients');
-      existing = patients.find(p => p.out_patient_id === out_patient_id);
-    }
 
-    if (existing) {
+    const patients = await db.list('Patients');
+    if (patients.some(p => p.out_patient_id === out_patient_id)) {
       return res.status(400).json({ error: `Out-Patient ID ${out_patient_id} is already registered.` });
     }
-    
+
     const newPatient = {
       out_patient_id,
       patient_name,
@@ -620,16 +616,8 @@ app.post('/api/patients', authenticateJWT, async (req, res) => {
       main_diagnosis,
       registered_date: new Date().toISOString().split('T')[0]
     };
-    
-    if (isPostgres) {
-      await pgPool.query(`
-        INSERT INTO patients (out_patient_id, patient_name, mobile, dob, gender, hospital, unit, main_diagnosis, registered_date)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      `, [newPatient.out_patient_id, newPatient.patient_name, newPatient.mobile, newPatient.dob, newPatient.gender, newPatient.hospital, newPatient.unit, newPatient.main_diagnosis, newPatient.registered_date]);
-    } else {
-      await appendExcelRow('Patients', newPatient);
-    }
 
+    await db.insert('Patients', newPatient);
     res.status(201).json(newPatient);
   } catch (error) {
     console.error(error);
@@ -637,112 +625,62 @@ app.post('/api/patients', authenticateJWT, async (req, res) => {
   }
 });
 
-// API: Get specific patient + their visit history
 app.get('/api/patients/:id', authenticateJWT, async (req, res) => {
   try {
     const { id } = req.params;
-    let patient = null;
-    let patientVisits = [];
+    const patients = await db.list('Patients');
+    const patient = patients.find(p => p.out_patient_id === id);
 
-    if (isPostgres) {
-      const pResult = await pgPool.query('SELECT * FROM patients WHERE out_patient_id = $1', [id]);
-      if (pResult.rows.length > 0) {
-        patient = {
-          ...pResult.rows[0],
-          dob: formatDate(pResult.rows[0].dob),
-          registered_date: formatDate(pResult.rows[0].registered_date)
-        };
-        const vResult = await pgPool.query('SELECT * FROM visits WHERE out_patient_id = $1 ORDER BY visit_date DESC', [id]);
-        patientVisits = vResult.rows.map(v => ({
-          ...v,
-          visit_date: formatDate(v.visit_date),
-          follow_up_date: formatDate(v.follow_up_date),
-          height_cm: v.height_cm ? Number(v.height_cm) : '',
-          weight_kg: v.weight_kg ? Number(v.weight_kg) : ''
-        }));
-      }
-    } else {
-      const patients = await readExcelSheet('Patients');
-      const found = patients.find(p => p.out_patient_id === id);
-      if (found) {
-        patient = found;
-        const visits = await readExcelSheet('Visits');
-        patientVisits = visits
-          .filter(v => v.out_patient_id === id)
-          .sort((a, b) => new Date(b.visit_date) - new Date(a.visit_date));
-      }
-    }
-    
     if (!patient) {
       return res.status(404).json({ error: 'Patient not found.' });
     }
-    
-    res.json({
-      ...patient,
-      visits: patientVisits
-    });
+
+    const visits = await db.list('Visits');
+    const patientVisits = visits
+      .filter(v => v.out_patient_id === id)
+      .sort((a, b) => new Date(b.visit_date) - new Date(a.visit_date));
+
+    res.json({ ...patient, visits: patientVisits });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to fetch patient details.' });
   }
 });
 
-// API: Add a visit for a patient
 app.post('/api/patients/:id/visits', authenticateJWT, async (req, res) => {
   try {
     const { id } = req.params;
-    const { 
-      visit_type, height_cm, weight_kg, affected_side, 
-      clinical_notes, diagnosis, treatment_plan, media_urls, 
-      follow_up_date, follow_up_status 
+    const {
+      visit_type, height_cm, weight_kg, affected_side,
+      clinical_notes, diagnosis, treatment_plan, media_urls,
+      follow_up_date, follow_up_status
     } = req.body;
-    
-    let mainDiag = '';
-    if (isPostgres) {
-      const result = await pgPool.query('SELECT main_diagnosis FROM patients WHERE out_patient_id = $1', [id]);
-      if (result.rows.length > 0) mainDiag = result.rows[0].main_diagnosis;
-    } else {
-      const patients = await readExcelSheet('Patients');
-      const patient = patients.find(p => p.out_patient_id === id);
-      if (patient) mainDiag = patient.main_diagnosis;
-    }
 
-    if (!mainDiag) {
+    const patients = await db.list('Patients');
+    const patient = patients.find(p => p.out_patient_id === id);
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found.' });
     }
-    
+
     const visitId = 'V-' + Math.floor(10000 + Math.random() * 90000);
-    
+
     const newVisit = {
       visit_id: visitId,
       out_patient_id: id,
       visit_date: new Date().toISOString().split('T')[0],
       visit_type: visit_type || 'Follow-up',
-      height_cm: height_cm ? Number(height_cm) : null,
-      weight_kg: weight_kg ? Number(weight_kg) : null,
+      height_cm: height_cm ? Number(height_cm) : '',
+      weight_kg: weight_kg ? Number(weight_kg) : '',
       affected_side: affected_side || 'N/A',
       clinical_notes: clinical_notes || '',
-      diagnosis: diagnosis || mainDiag,
+      diagnosis: diagnosis || patient.main_diagnosis,
       treatment_plan: treatment_plan || '',
       media_urls: media_urls || '',
-      follow_up_date: follow_up_date || null,
+      follow_up_date: follow_up_date || '',
       follow_up_status: follow_up_date ? (follow_up_status || 'Pending') : ''
     };
-    
-    if (isPostgres) {
-      await pgPool.query(`
-        INSERT INTO visits (visit_id, out_patient_id, visit_date, visit_type, height_cm, weight_kg, affected_side, clinical_notes, diagnosis, treatment_plan, media_urls, follow_up_date, follow_up_status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-      `, [
-        newVisit.visit_id, newVisit.out_patient_id, newVisit.visit_date, newVisit.visit_type,
-        newVisit.height_cm, newVisit.weight_kg, newVisit.affected_side, newVisit.clinical_notes,
-        newVisit.diagnosis, newVisit.treatment_plan, newVisit.media_urls,
-        newVisit.follow_up_date, newVisit.follow_up_status
-      ]);
-    } else {
-      await appendExcelRow('Visits', newVisit);
-    }
-    
+
+    await db.insert('Visits', newVisit);
     res.status(201).json(newVisit);
   } catch (error) {
     console.error(error);
@@ -750,153 +688,87 @@ app.post('/api/patients/:id/visits', authenticateJWT, async (req, res) => {
   }
 });
 
-// API: Update an existing visit (e.g. mark follow-up completed, or reschedule)
 app.patch('/api/visits/:visit_id', authenticateJWT, async (req, res) => {
   try {
     const { visit_id } = req.params;
-    const updateData = req.body;
-    
-    if (isPostgres) {
-      const keys = Object.keys(updateData);
-      const values = Object.values(updateData);
-      
-      if (keys.length > 0) {
-        const setQuery = keys.map((k, index) => `${k} = $${index + 1}`).join(', ');
-        values.push(visit_id);
-        await pgPool.query(`UPDATE visits SET ${setQuery} WHERE visit_id = $${values.length}`, values);
-      }
-    } else {
-      await updateExcelRow('Visits', 'visit_id', visit_id, updateData);
-    }
-
+    await db.update('Visits', 'visit_id', visit_id, req.body);
     res.json({ message: 'Visit details updated successfully.' });
   } catch (error) {
     console.error(error);
+    if (error.message && error.message.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
     res.status(500).json({ error: 'Failed to update visit status.' });
   }
 });
 
-// API: Get follow-ups list
 app.get('/api/followups', authenticateJWT, async (req, res) => {
   try {
-    if (isPostgres) {
-      const result = await pgPool.query(`
-        SELECT v.visit_id, v.out_patient_id, p.patient_name, p.mobile, p.main_diagnosis,
-               v.visit_date, v.diagnosis AS diagnosis_recorded, v.follow_up_date, v.follow_up_status
-        FROM visits v
-        JOIN patients p ON v.out_patient_id = p.out_patient_id
-        WHERE v.follow_up_date IS NOT NULL AND v.follow_up_status IS NOT NULL AND v.follow_up_status <> ''
-      `);
-      const formatted = result.rows.map(r => ({
-        ...r,
-        visit_date: formatDate(r.visit_date),
-        follow_up_date: formatDate(r.follow_up_date)
-      }));
-      res.json(formatted);
-    } else {
-      const visits = await readExcelSheet('Visits');
-      const patients = await readExcelSheet('Patients');
-      
-      const scheduledFollowUps = visits.filter(v => v.follow_up_date && v.follow_up_status !== '');
-      const results = scheduledFollowUps.map(v => {
-        const patient = patients.find(p => p.out_patient_id === v.out_patient_id) || {};
-        return {
-          visit_id: v.visit_id,
-          out_patient_id: v.out_patient_id,
-          patient_name: patient.patient_name || 'Unknown',
-          mobile: patient.mobile || '',
-          main_diagnosis: patient.main_diagnosis || '',
-          visit_date: v.visit_date,
-          diagnosis_recorded: v.diagnosis,
-          follow_up_date: v.follow_up_date,
-          follow_up_status: v.follow_up_status
-        };
-      });
-      res.json(results);
-    }
+    const visits = await db.list('Visits');
+    const patients = await db.list('Patients');
+
+    const scheduledFollowUps = visits.filter(v => v.follow_up_date && v.follow_up_status !== '');
+    const results = scheduledFollowUps.map(v => {
+      const patient = patients.find(p => p.out_patient_id === v.out_patient_id) || {};
+      return {
+        visit_id: v.visit_id,
+        out_patient_id: v.out_patient_id,
+        patient_name: patient.patient_name || 'Unknown',
+        mobile: patient.mobile || '',
+        main_diagnosis: patient.main_diagnosis || '',
+        visit_date: v.visit_date,
+        diagnosis_recorded: v.diagnosis,
+        follow_up_date: v.follow_up_date,
+        follow_up_status: v.follow_up_status
+      };
+    });
+    res.json(results);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to retrieve follow-up schedules.' });
   }
 });
 
-// API: Public status check (Unauthenticated)
+// ── API: Status (unauthenticated) ─────────────────────────────────────────
+
 app.get('/api/status', (req, res) => {
   res.json({
-    isPostgres,
-    dbEngine: isPostgres ? 'PostgreSQL (Supabase Cloud)' : 'Local Microsoft Excel Worksheet',
-    useLocalExcel: process.env.USE_LOCAL_EXCEL === 'true'
+    dbEngine,
+    dbEngineLabel: dbEngine === 'sheets' ? 'Google Sheets' : 'Local Microsoft Excel Worksheet',
+    storageEngine,
+    storageEngineLabel: storageEngine === 'drive' ? 'Google Drive' : 'Local Disk Storage',
+    googleSignInEnabled: !!googleOAuthClient,
+    googleClientId: GOOGLE_OAUTH_CLIENT_ID
   });
 });
 
-// API: File Upload Endpoint
-app.post('/api/upload', upload.single('media'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded.' });
-    }
-    const relativeUrl = `/uploads/${req.file.filename}`;
-    res.json({ url: relativeUrl, filename: req.file.filename });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'File upload failed.' });
-  }
-});
+// ── API: Dashboard stats ──────────────────────────────────────────────────
 
-// API: Get summary statistics for Dashboard
 app.get('/api/stats', authenticateJWT, async (req, res) => {
   try {
-    let totalPatients = 0;
-    let visitsToday = 0;
-    let pendingFollowUps = 0;
-    let overdueFollowUps = 0;
-    let recentRegistrations = 0;
+    const patients = await db.list('Patients');
+    const visits = await db.list('Visits');
 
     const todayStr = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    if (isPostgres) {
-      const pCountRes = await pgPool.query('SELECT COUNT(*) FROM patients');
-      totalPatients = parseInt(pCountRes.rows[0].count);
+    const totalPatients = patients.length;
+    const visitsToday = visits.filter(v => v.visit_date === todayStr).length;
 
-      const vTodayRes = await pgPool.query('SELECT COUNT(*) FROM visits WHERE visit_date = CURRENT_DATE');
-      visitsToday = parseInt(vTodayRes.rows[0].count);
+    let pendingFollowUps = 0;
+    let overdueFollowUps = 0;
+    visits.filter(v => v.follow_up_date).forEach(f => {
+      if (f.follow_up_status === 'Pending') {
+        const isPast = new Date(f.follow_up_date) < new Date(todayStr);
+        if (isPast) overdueFollowUps++;
+        else pendingFollowUps++;
+      } else if (f.follow_up_status === 'Overdue') {
+        overdueFollowUps++;
+      }
+    });
 
-      const fUpsRes = await pgPool.query("SELECT follow_up_date, follow_up_status FROM visits WHERE follow_up_date IS NOT NULL AND follow_up_status <> ''");
-      fUpsRes.rows.forEach(f => {
-        const fDateStr = formatDate(f.follow_up_date);
-        if (f.follow_up_status === 'Pending') {
-          const isPast = new Date(fDateStr) < new Date(todayStr);
-          if (isPast) overdueFollowUps++;
-          else pendingFollowUps++;
-        } else if (f.follow_up_status === 'Overdue') {
-          overdueFollowUps++;
-        }
-      });
-
-      const pRecentRes = await pgPool.query('SELECT COUNT(*) FROM patients WHERE registered_date >= NOW() - INTERVAL \'30 days\'');
-      recentRegistrations = parseInt(pRecentRes.rows[0].count);
-
-    } else {
-      const patients = await readExcelSheet('Patients');
-      const visits = await readExcelSheet('Visits');
-      
-      totalPatients = patients.length;
-      visitsToday = visits.filter(v => v.visit_date === todayStr).length;
-      
-      const followUps = visits.filter(v => v.follow_up_date);
-      followUps.forEach(f => {
-        if (f.follow_up_status === 'Pending') {
-          const isPast = new Date(f.follow_up_date) < new Date(todayStr);
-          if (isPast) overdueFollowUps++;
-          else pendingFollowUps++;
-        } else if (f.follow_up_status === 'Overdue') {
-          overdueFollowUps++;
-        }
-      });
-      recentRegistrations = patients.filter(p => new Date(p.registered_date) >= thirtyDaysAgo).length;
-    }
+    const recentRegistrations = patients.filter(p => new Date(p.registered_date) >= thirtyDaysAgo).length;
 
     res.json({
       totalPatients,
@@ -904,8 +776,8 @@ app.get('/api/stats', authenticateJWT, async (req, res) => {
       pendingFollowUps,
       overdueFollowUps,
       recentRegistrations,
-      excelPath: isPostgres ? 'Supabase cloud PostgreSQL database instance.' : DB_FILE,
-      dbEngine: isPostgres ? 'PostgreSQL (Supabase Cloud)' : 'Local Microsoft Excel Worksheet'
+      dbEngine,
+      dbEngineLabel: dbEngine === 'sheets' ? 'Google Sheets' : 'Local Microsoft Excel Worksheet'
     });
   } catch (error) {
     console.error(error);
@@ -913,129 +785,56 @@ app.get('/api/stats', authenticateJWT, async (req, res) => {
   }
 });
 
-// API: Get user accounts (Admin only)
+// ── API: User accounts (Admin only) ───────────────────────────────────────
+
 app.get('/api/admin/users', authenticateJWT, requireAdmin, async (req, res) => {
   try {
-    if (isPostgres) {
-      const result = await pgPool.query('SELECT id, email, role, created_at FROM public.profiles ORDER BY created_at DESC');
-      const formatted = result.rows.map(r => ({
-        ...r,
-        created_at: formatDate(r.created_at)
-      }));
-      res.json(formatted);
-    } else {
-      res.json([
-        { id: 'poc-admin-id', email: 'doctor@popms.com', role: 'admin', created_at: new Date().toISOString().split('T')[0] }
-      ]);
-    }
-  } catch (err) {
-    console.error(err);
+    const profiles = await db.list('Profiles');
+    res.json(profiles);
+  } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Failed to retrieve registered users.' });
   }
 });
 
-// API: Change user role permissions (Admin only)
 app.patch('/api/admin/users/:id', authenticateJWT, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { role } = req.body;
-  
+
   if (role !== 'admin' && role !== 'doctor') {
     return res.status(400).json({ error: 'Invalid role assignment. Choose admin or doctor.' });
   }
 
   try {
-    if (isPostgres) {
-      await pgPool.query('UPDATE public.profiles SET role = $1 WHERE id = $2', [role, id]);
-      res.json({ message: 'User role updated successfully.' });
-    } else {
-      res.json({ message: 'User role updated successfully (Excel Mock).' });
+    await db.update('Profiles', 'id', id, { role });
+    res.json({ message: 'User role updated successfully.' });
+  } catch (error) {
+    console.error(error);
+    if (error.message && error.message.includes('not found')) {
+      return res.status(404).json({ error: error.message });
     }
-  } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Failed to assign user role.' });
   }
 });
 
-// API: Download Raw Excel Sheet Backup (Admin only)
+// ── API: Spreadsheet backup download (Admin only) ─────────────────────────
+
 app.get('/api/database/backup', authenticateJWT, requireAdmin, async (req, res) => {
   try {
-    if (isPostgres) {
-      console.log('[Database] Compiling Excel file on-the-fly from Supabase tables...');
-      const workbook = new exceljs.Workbook();
-      
-      const patientsSheet = workbook.addWorksheet('Patients');
-      patientsSheet.columns = [
-        { header: 'out_patient_id', key: 'out_patient_id', width: 15 },
-        { header: 'patient_name', key: 'patient_name', width: 25 },
-        { header: 'mobile', key: 'mobile', width: 18 },
-        { header: 'dob', key: 'dob', width: 12 },
-        { header: 'gender', key: 'gender', width: 10 },
-        { header: 'hospital', key: 'hospital', width: 20 },
-        { header: 'unit', key: 'unit', width: 25 },
-        { header: 'main_diagnosis', key: 'main_diagnosis', width: 35 },
-        { header: 'registered_date', key: 'registered_date', width: 15 }
-      ];
-      patientsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-      patientsSheet.getRow(1).fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FF1E3A8A' }
-      };
-      
-      const pResult = await pgPool.query('SELECT * FROM patients ORDER BY registered_date DESC');
-      pResult.rows.forEach(p => {
-        patientsSheet.addRow({
-          ...p,
-          dob: formatDate(p.dob),
-          registered_date: formatDate(p.registered_date)
-        });
-      });
-      
-      const visitsSheet = workbook.addWorksheet('Visits');
-      visitsSheet.columns = [
-        { header: 'visit_id', key: 'visit_id', width: 15 },
-        { header: 'out_patient_id', key: 'out_patient_id', width: 15 },
-        { header: 'visit_date', key: 'visit_date', width: 12 },
-        { header: 'visit_type', key: 'visit_type', width: 15 },
-        { header: 'height_cm', key: 'height_cm', width: 12 },
-        { header: 'weight_kg', key: 'weight_kg', width: 12 },
-        { header: 'affected_side', key: 'affected_side', width: 15 },
-        { header: 'clinical_notes', key: 'clinical_notes', width: 50 },
-        { header: 'diagnosis', key: 'diagnosis', width: 35 },
-        { header: 'treatment_plan', key: 'treatment_plan', width: 35 },
-        { header: 'media_urls', key: 'media_urls', width: 40 },
-        { header: 'follow_up_date', key: 'follow_up_date', width: 15 },
-        { header: 'follow_up_status', key: 'follow_up_status', width: 15 }
-      ];
-      visitsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-      visitsSheet.getRow(1).fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FF0D9488' }
-      };
-      
-      const vResult = await pgPool.query('SELECT * FROM visits ORDER BY visit_date DESC');
-      vResult.rows.forEach(v => {
-        visitsSheet.addRow({
-          ...v,
-          visit_date: formatDate(v.visit_date),
-          follow_up_date: formatDate(v.follow_up_date),
-          height_cm: v.height_cm ? Number(v.height_cm) : '',
-          weight_kg: v.weight_kg ? Number(v.weight_kg) : ''
-        });
-      });
-      
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 'attachment; filename=popms_supabase_backup.xlsx');
-      await workbook.xlsx.write(res);
-      res.end();
-    } else {
-      if (fs.existsSync(DB_FILE)) {
-        res.download(DB_FILE, 'popms_backup.xlsx');
-      } else {
-        res.status(404).json({ error: 'Database file not found.' });
-      }
+    const workbook = new exceljs.Workbook();
+    for (const table of Object.keys(TABLE_SCHEMAS)) {
+      const sheet = workbook.addWorksheet(table);
+      sheet.columns = TABLE_SCHEMAS[table].map(col => ({ header: col, key: col, width: COLUMN_WIDTHS[col] || 20 }));
+      sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SHEET_HEADER_COLORS[table] } };
+      const rows = await db.list(table);
+      rows.forEach(row => sheet.addRow(row));
     }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=popms_backup.xlsx');
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (error) {
     console.error('Backup generation error:', error);
     res.status(500).json({ error: 'Failed to generate spreadsheet download.' });
@@ -1045,7 +844,7 @@ app.get('/api/database/backup', authenticateJWT, requireAdmin, async (req, res) 
 // Serve static assets in production (if built)
 const DIST_DIR = path.join(__dirname, 'dist');
 if (fs.existsSync(DIST_DIR)) {
-  console.log(`[Production] Detected static build folder. Enabling single-service static hosting.`);
+  console.log('[Production] Detected static build folder. Enabling single-service static hosting.');
   app.use(express.static(DIST_DIR));
   app.get('*', (req, res) => {
     if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
@@ -1054,48 +853,53 @@ if (fs.existsSync(DIST_DIR)) {
   });
 }
 
-// Start Server and Initialize Database Engine
-app.listen(PORT, async () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  
-  const USE_LOCAL_EXCEL = process.env.USE_LOCAL_EXCEL === 'true';
-  
-  if (USE_LOCAL_EXCEL) {
-    console.log('[Database] USE_LOCAL_EXCEL is enabled. Running in offline Excel Mode.');
-    isPostgres = false;
-    await initializeExcelDatabase();
-  } else {
-    const dbUrl = process.env.DATABASE_URL;
-    if (!dbUrl) {
-      console.error('\n❌ DATABASE CONNECTION ERROR: DATABASE_URL is missing in environment variables.');
-      console.error('To run in offline PoC mode, set USE_LOCAL_EXCEL=true in your .env file.');
-      console.error('To connect to Supabase Cloud, add the DATABASE_URL connection string.\n');
-      process.exit(1);
-    }
-    
-    console.log('[Database] Connecting to Supabase PostgreSQL...');
+// ── Start Server and resolve database / storage engines ──────────────────
+
+async function startServer() {
+  const useLocalExcel = process.env.USE_LOCAL_EXCEL === 'true';
+  const sheetsConfigured = !!(sheetsApi && process.env.GOOGLE_SHEETS_ID);
+
+  if (!useLocalExcel && sheetsConfigured) {
     try {
-      pgPool = new Pool({
-        connectionString: dbUrl,
-        ssl: {
-          rejectUnauthorized: false
-        }
-      });
-      
-      // Test connection
-      await pgPool.query('SELECT NOW()');
-      console.log('[Database] Successfully connected to Supabase PostgreSQL cloud database!');
-      isPostgres = true;
-      
-      // Initialize SQL Tables, Profiles, Triggers, and Seed
-      await initializePostgres();
-      
+      const sheetsBackend = createSheetsBackend(process.env.GOOGLE_SHEETS_ID);
+      await sheetsBackend.initialize();
+      db = sheetsBackend;
+      dbEngine = 'sheets';
+      console.log('[Database] Connected to Google Sheets.');
     } catch (err) {
-      console.error('\n❌ DATABASE CONNECTION ERROR: Failed to connect to Supabase PostgreSQL.');
-      console.error(err.message);
-      console.error('App start aborted. Verify database credentials.\n');
-      process.exit(1);
+      console.error('[Database] Failed to initialize Google Sheets, falling back to local Excel:', err.message);
     }
   }
-});
-// Trigger nodemon reload for updated env config (added Supabase keys)
+
+  if (dbEngine !== 'sheets') {
+    const excelBackend = createExcelBackend(DB_FILE);
+    await excelBackend.initialize();
+    db = excelBackend;
+    dbEngine = 'excel';
+    console.log(`[Database] Using local Excel workbook fallback at ${DB_FILE}`);
+  }
+
+  const driveConfigured = !!(driveApi && process.env.GOOGLE_DRIVE_FOLDER_ID);
+  if (driveConfigured) {
+    try {
+      await driveApi.files.get({ fileId: process.env.GOOGLE_DRIVE_FOLDER_ID, fields: 'id' });
+      storageEngine = 'drive';
+      console.log('[Storage] Connected to Google Drive folder.');
+    } catch (err) {
+      console.error('[Storage] Failed to access Google Drive folder, falling back to local disk storage:', err.message);
+    }
+  }
+  if (storageEngine !== 'drive') {
+    console.log(`[Storage] Using local disk storage fallback at ${UPLOADS_DIR}`);
+  }
+
+  if (!googleOAuthClient) {
+    console.log('[Auth] GOOGLE_OAUTH_CLIENT_ID not set — Google Sign-In disabled, local bypass login only.');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

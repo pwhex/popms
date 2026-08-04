@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { Activity, Users, Calendar, Database, HeartPulse, Sparkles, Key, LogOut } from 'lucide-react';
-import { createClient } from '@supabase/supabase-js';
 import Dashboard from './components/Dashboard.jsx';
 import PatientDirectory from './components/PatientDirectory.jsx';
 import PatientDetails from './components/PatientDetails.jsx';
@@ -9,92 +8,61 @@ import ExcelManager from './components/ExcelManager.jsx';
 import Login from './components/Login.jsx';
 import AdminPanel from './components/AdminPanel.jsx';
 
-// Supabase Configuration
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://iecekupqbcexwiyuoxeq.supabase.co';
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_wvT3hBOG8uhWSlzE7gdFEw_vkrG1gNz';
+const SESSION_STORAGE_KEY = 'popms_session';
 
-let supabase = null;
-if (SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes('[your-')) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+function loadStoredSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 function App() {
-  const [session, setSession] = useState(null);
-  const [userRole, setUserRole] = useState('doctor'); // 'admin' or 'doctor'
-  const [profileLoading, setProfileLoading] = useState(false);
+  const [session, setSession] = useState(loadStoredSession);
+  const [userRole, setUserRole] = useState(() => loadStoredSession()?.role || 'doctor');
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedPatientId, setSelectedPatientId] = useState(null);
-  const [dbStatus, setDbStatus] = useState({ isPostgres: null, dbEngine: 'Loading...' });
+  const [dbStatus, setDbStatus] = useState({ dbEngine: null });
   const [stats, setStats] = useState({
     totalPatients: 0,
     visitsToday: 0,
     pendingFollowUps: 0,
     overdueFollowUps: 0,
     recentRegistrations: 0,
-    excelPath: '',
-    dbEngine: 'Local Microsoft Excel Worksheet'
+    dbEngineLabel: ''
   });
 
-  // Fetch User Role Profile from Supabase
-  const fetchUserProfile = async (currentUser) => {
-    if (!supabase || !currentUser) return;
-    setProfileLoading(true);
-    try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('role')
-        .eq('id', currentUser.id)
-        .single();
-      
-      if (data) {
-        setUserRole(data.role || 'doctor');
-      } else if (error) {
-        console.error('Error fetching role:', error.message);
-        setUserRole('doctor');
-      }
-    } catch (err) {
-      console.error(err);
-      setUserRole('doctor');
-    } finally {
-      setProfileLoading(false);
-    }
-  };
-
   useEffect(() => {
-    // Query database engine status from Node server (unauthenticated)
     fetch('/api/status')
       .then(res => res.json())
       .then(data => {
         setDbStatus(data);
-        // Immediately update stats.dbEngine from the public status endpoint
-        setStats(prev => ({ ...prev, dbEngine: data.dbEngine }));
+        setStats(prev => ({ ...prev, dbEngineLabel: data.dbEngineLabel }));
       })
       .catch(err => {
         console.error('Failed to load DB status:', err);
-        setDbStatus({ isPostgres: false, dbEngine: 'Local Microsoft Excel Worksheet' });
+        setDbStatus({
+          dbEngine: 'excel',
+          dbEngineLabel: 'Local Microsoft Excel Worksheet',
+          storageEngine: 'local',
+          storageEngineLabel: 'Local Disk Storage',
+          googleSignInEnabled: false,
+          googleClientId: null
+        });
       });
-
-    // Set up Supabase auth listener
-    if (supabase) {
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        setSession(session);
-        if (session) {
-          fetchUserProfile(session.user);
-        }
-      });
-
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, currentSession) => {
-        setSession(currentSession);
-        if (currentSession) {
-          fetchUserProfile(currentSession.user);
-        } else {
-          setUserRole('doctor');
-        }
-      });
-
-      return () => subscription.unsubscribe();
-    }
   }, []);
+
+  const persistSession = (data) => {
+    setSession(data);
+    setUserRole(data?.role || 'doctor');
+    if (data) {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(data));
+    } else {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+    }
+  };
 
   // Authenticated Fetch wrapper helper
   const authFetch = async (url, options = {}) => {
@@ -102,10 +70,12 @@ function App() {
     if (session && session.access_token) {
       headers['Authorization'] = `Bearer ${session.access_token}`;
     }
-    return fetch(url, {
-      ...options,
-      headers
-    });
+    const res = await fetch(url, { ...options, headers });
+    if (res.status === 401) {
+      // Clear stale session (expired token, or backend restarted with a new secret)
+      persistSession(null);
+    }
+    return res;
   };
 
   const fetchStats = async () => {
@@ -114,8 +84,7 @@ function App() {
       const res = await authFetch('/api/stats');
       if (res.ok) {
         const data = await res.json();
-        // Always preserve dbEngine from the public status endpoint
-        setStats(prev => ({ ...data, dbEngine: prev.dbEngine || data.dbEngine }));
+        setStats(prev => ({ ...data, dbEngineLabel: prev.dbEngineLabel || data.dbEngineLabel }));
       }
     } catch (err) {
       console.error('Error fetching statistics:', err);
@@ -133,12 +102,8 @@ function App() {
     setActiveTab('patient-details');
   };
 
-  const handleLogout = async () => {
-    if (supabase) {
-      await supabase.auth.signOut();
-    } else {
-      setSession(null);
-    }
+  const handleLogout = () => {
+    persistSession(null);
   };
 
   // Render sub-components based on activeTab
@@ -146,49 +111,50 @@ function App() {
     switch (activeTab) {
       case 'dashboard':
         return (
-          <Dashboard 
-            stats={stats} 
-            viewPatientDetails={viewPatientDetails} 
+          <Dashboard
+            stats={stats}
+            viewPatientDetails={viewPatientDetails}
             setActiveTab={setActiveTab}
             authFetch={authFetch}
           />
         );
       case 'patients':
         return (
-          <PatientDirectory 
-            viewPatientDetails={viewPatientDetails} 
+          <PatientDirectory
+            viewPatientDetails={viewPatientDetails}
             onStatsChange={fetchStats}
             authFetch={authFetch}
           />
         );
       case 'patient-details':
         return (
-          <PatientDetails 
-            patientId={selectedPatientId} 
-            onBack={() => setActiveTab('patients')} 
+          <PatientDetails
+            patientId={selectedPatientId}
+            onBack={() => setActiveTab('patients')}
             onStatsChange={fetchStats}
             authFetch={authFetch}
           />
         );
       case 'followups':
         return (
-          <FollowUpTracker 
-            viewPatientDetails={viewPatientDetails} 
+          <FollowUpTracker
+            viewPatientDetails={viewPatientDetails}
             onStatsChange={fetchStats}
             authFetch={authFetch}
           />
         );
       case 'excel':
         return (
-          <ExcelManager 
-            stats={stats} 
+          <ExcelManager
+            stats={stats}
+            dbStatus={dbStatus}
             onStatsChange={fetchStats}
             session={session}
           />
         );
       case 'users':
         return (
-          <AdminPanel 
+          <AdminPanel
             session={session}
           />
         );
@@ -199,7 +165,7 @@ function App() {
 
   // Wait for backend status check before rendering login
   if (!session) {
-    if (dbStatus.isPostgres === null) {
+    if (dbStatus.dbEngine === null) {
       // Still loading status from backend
       return (
         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
@@ -209,14 +175,10 @@ function App() {
     }
 
     return (
-      <Login 
-        supabase={dbStatus.isPostgres ? supabase : null} 
-        onLoginSuccess={(data) => { 
-          setSession(data); 
-          if (!dbStatus.isPostgres) {
-            setUserRole('admin');
-          }
-        }} 
+      <Login
+        googleClientId={dbStatus.googleClientId}
+        googleSignInEnabled={dbStatus.googleSignInEnabled}
+        onLoginSuccess={persistSession}
       />
     );
   }
@@ -238,33 +200,33 @@ function App() {
         </div>
 
         <nav className="nav-menu">
-          <div 
+          <div
             className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`}
             onClick={() => { setActiveTab('dashboard'); setSelectedPatientId(null); }}
           >
             <Activity size={20} />
             <span>Dashboard</span>
           </div>
-          
-          <div 
+
+          <div
             className={`nav-item ${activeTab === 'patients' || activeTab === 'patient-details' ? 'active' : ''}`}
             onClick={() => { setActiveTab('patients'); setSelectedPatientId(null); }}
           >
             <Users size={20} />
             <span>Patients</span>
           </div>
-          
-          <div 
+
+          <div
             className={`nav-item ${activeTab === 'followups' ? 'active' : ''}`}
             onClick={() => { setActiveTab('followups'); setSelectedPatientId(null); }}
           >
             <Calendar size={20} />
             <span>Follow-Ups</span>
           </div>
-          
+
           {/* Admin Restricted Database Configuration */}
           {isAdmin && (
-            <div 
+            <div
               className={`nav-item ${activeTab === 'excel' ? 'active' : ''}`}
               onClick={() => { setActiveTab('excel'); setSelectedPatientId(null); }}
             >
@@ -275,7 +237,7 @@ function App() {
 
           {/* Admin Restricted Access Control */}
           {isAdmin && (
-            <div 
+            <div
               className={`nav-item ${activeTab === 'users' ? 'active' : ''}`}
               onClick={() => { setActiveTab('users'); setSelectedPatientId(null); }}
             >
@@ -304,7 +266,7 @@ function App() {
         <div className="sidebar-footer" style={{ marginTop: '20px' }}>
           <Sparkles size={14} style={{ color: '#fbbf24', marginBottom: '4px' }} />
           <div>Kings Hospital</div>
-          <div>v1.1.0 (SQL / Cloud)</div>
+          <div>v1.2.0 (Sheets / Drive)</div>
         </div>
       </aside>
 

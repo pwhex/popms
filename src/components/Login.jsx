@@ -1,74 +1,65 @@
-import React, { useState } from 'react';
-import { HeartPulse, Lock, Mail, ShieldAlert, Sparkles, Activity } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { HeartPulse, ShieldAlert, Activity } from 'lucide-react';
 
-function Login({ supabase, onLoginSuccess }) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [isSignUp, setIsSignUp] = useState(false);
+function Login({ googleClientId, googleSignInEnabled, onLoginSuccess }) {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
-  const [successMsg, setSuccessMsg] = useState('');
+  const googleButtonRef = useRef(null);
 
-  const handleAuth = async (e) => {
-    e.preventDefault();
+  const handleGoogleCredential = async (response) => {
     setErrorMsg('');
-    setSuccessMsg('');
     setLoading(true);
-
-    if (!supabase) {
-      // Excel PoC Bypass mode
-      setTimeout(() => {
-        onLoginSuccess({
-          access_token: 'poc-bypass-token',
-          user: { email: 'doctor@popms.com', id: 'poc-user-id' }
-        });
-        setLoading(false);
-      }, 600);
-      return;
-    }
-
     try {
-      if (isSignUp) {
-        const { data, error } = await supabase.auth.signUp({ email, password });
-        if (error) {
-          setErrorMsg(error.message);
-        } else {
-          setSuccessMsg('Account registered successfully! Check your inbox for a verification email, or log in if email confirmation is disabled.');
-          setIsSignUp(false);
-        }
+      const res = await fetch('/api/auth/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential: response.credential })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        onLoginSuccess(data);
       } else {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) {
-          setErrorMsg(error.message);
-        } else if (data.session) {
-          // Fetch user role
-          const token = data.session.access_token;
-          const statsRes = await fetch('/api/stats', {
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          
-          let role = 'doctor';
-          if (statsRes.ok) {
-            // Note: role verification is also queried in frontend app level, 
-            // but we can pass user info.
-          }
-          onLoginSuccess(data.session);
-        }
+        setErrorMsg(data.error || 'Google sign-in failed.');
       }
     } catch (err) {
       console.error(err);
-      setErrorMsg('An unexpected authentication error occurred.');
+      setErrorMsg('Network error during Google sign-in.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleBypass = () => {
-    onLoginSuccess({
-      user: { email: 'doctor@popms.com', id: 'poc-user-id' },
-      role: 'admin',
-      session: { access_token: 'poc-bypass-token' }
+  useEffect(() => {
+    if (!googleSignInEnabled || !googleClientId || !window.google || !googleButtonRef.current) return;
+
+    window.google.accounts.id.initialize({
+      client_id: googleClientId,
+      callback: handleGoogleCredential
     });
+    window.google.accounts.id.renderButton(googleButtonRef.current, {
+      theme: 'filled_blue',
+      size: 'large',
+      width: 320
+    });
+  }, [googleSignInEnabled, googleClientId]);
+
+  const handleBypass = async () => {
+    setErrorMsg('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/bypass', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        onLoginSuccess(data);
+      } else {
+        setErrorMsg(data.error || 'Unable to start local session.');
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg('Network error while starting local session.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -82,89 +73,41 @@ function Login({ supabase, onLoginSuccess }) {
           <span>Pediatric Orthopedic Patient Management System</span>
         </div>
 
-        {/* Local PoC Banner */}
-        {!supabase && (
-          <div className="poc-banner">
-            <Activity size={16} />
-            <span>
-              <strong>Local PoC Mode Active:</strong> Supabase keys are not set. You can bypass the login gateway.
-            </span>
+        {errorMsg && (
+          <div className="login-alert error">
+            <ShieldAlert size={16} />
+            <span>{errorMsg}</span>
           </div>
         )}
 
-        <form onSubmit={handleAuth} className="login-form">
-          {errorMsg && (
-            <div className="login-alert error">
-              <ShieldAlert size={16} />
-              <span>{errorMsg}</span>
-            </div>
+        <div className="login-form" style={{ display: 'flex', flexDirection: 'column', gap: '16px', alignItems: 'center' }}>
+          {googleSignInEnabled && (
+            <div ref={googleButtonRef} style={{ display: 'flex', justifyContent: 'center' }} />
           )}
 
-          {successMsg && (
-            <div className="login-alert success">
-              <Sparkles size={16} style={{ color: 'var(--success)' }} />
-              <span>{successMsg}</span>
-            </div>
-          )}
-
-          <div className="form-group">
-            <label>Clinical Email</label>
-            <div className="input-with-icon">
-              <Mail size={18} className="input-icon" />
-              <input 
-                type="email" 
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="doctor@hospital.com"
-                required={supabase ? true : false}
-                disabled={loading}
-              />
-            </div>
-          </div>
-
-          <div className="form-group">
-            <label>Security Password</label>
-            <div className="input-with-icon">
-              <Lock size={18} className="input-icon" />
-              <input 
-                type="password" 
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                required={supabase ? true : false}
-                disabled={loading}
-              />
-            </div>
-          </div>
-
-          {supabase ? (
-            <button type="submit" className="btn btn-primary login-btn" disabled={loading}>
-              {loading ? 'Authenticating...' : isSignUp ? 'Create Account' : 'Log In'}
-            </button>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '10px' }}>
-              <button type="submit" className="btn btn-primary login-btn">
-                Bypass Login
-              </button>
-            </div>
-          )}
-
-          {supabase && (
+          {googleSignInEnabled && (
             <div className="auth-toggle">
-              {isSignUp ? (
-                <p>
-                  Already have an account?{' '}
-                  <span onClick={() => setIsSignUp(false)}>Sign In</span>
-                </p>
-              ) : (
-                <p>
-                  New staff member?{' '}
-                  <span onClick={() => setIsSignUp(true)}>Sign Up</span>
-                </p>
-              )}
+              <p>or</p>
             </div>
           )}
-        </form>
+
+          <button
+            type="button"
+            className="btn btn-primary login-btn"
+            onClick={handleBypass}
+            disabled={loading}
+            style={{ width: '100%' }}
+          >
+            {loading ? 'Starting session...' : 'Continue without Google'}
+          </button>
+        </div>
+
+        {!googleSignInEnabled && (
+          <div className="poc-banner">
+            <Activity size={16} />
+            <span>Google Sign-In is not configured on this server. Continuing starts a local session.</span>
+          </div>
+        )}
       </div>
     </div>
   );
