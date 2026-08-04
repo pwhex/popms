@@ -8,6 +8,7 @@ npm-debug.log*
 
 # Production Build output
 dist/
+release/
 
 # Local databases & patient medical photos (HIPAA & Confidentiality protection)
 *.xlsx

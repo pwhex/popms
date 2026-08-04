@@ -12,26 +12,31 @@ import dotenv from 'dotenv';
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
-dotenv.config();
+// POPMS_ENV_FILE lets a host process (e.g. the Electron wrapper) point this
+// at a config file outside the app bundle, since a packaged app's own
+// directory is typically read-only.
+dotenv.config(process.env.POPMS_ENV_FILE ? { path: process.env.POPMS_ENV_FILE } : undefined);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
 
 // Setup local media directory (used when Google Drive storage is not configured)
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// POPMS_UPLOADS_DIR overrides this to a writable location outside the app bundle.
+const UPLOADS_DIR = process.env.POPMS_UPLOADS_DIR || path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // Excel Database Path (fallback when Google Sheets is not configured)
-const DB_FILE = path.join(__dirname, 'popms_database.xlsx');
+// POPMS_DB_FILE overrides this to a writable location outside the app bundle.
+const DB_FILE = process.env.POPMS_DB_FILE || path.join(__dirname, 'popms_database.xlsx');
 
 // Shared table schema, used by both the Excel and Google Sheets backends
 const TABLE_SCHEMAS = {
