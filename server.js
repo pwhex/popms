@@ -21,7 +21,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+// 8420 avoids common collisions on both platforms (macOS AirPlay Receiver
+// squats on 5000/7000; 3000/8000/8080 are common dev-server defaults).
+const PORT = process.env.PORT || 8420;
 
 app.use(cors());
 app.use(express.json());

@@ -24,7 +24,7 @@ if (!fs.existsSync(envFile)) {
 process.env.POPMS_ENV_FILE = envFile;
 process.env.POPMS_DB_FILE = path.join(configDir, 'popms_database.xlsx');
 process.env.POPMS_UPLOADS_DIR = path.join(configDir, 'uploads');
-process.env.PORT = process.env.PORT || '5000';
+process.env.PORT = process.env.PORT || '8420';
 
 let mainWindow;
 

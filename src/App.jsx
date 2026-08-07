@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Users, Calendar, Database, HeartPulse, Sparkles, Key, LogOut } from 'lucide-react';
+import { Activity, Users, Calendar, Database, HeartPulse, Key, LogOut, ChevronLeft, ChevronRight } from 'lucide-react';
 import Dashboard from './components/Dashboard.jsx';
 import PatientDirectory from './components/PatientDirectory.jsx';
 import PatientDetails from './components/PatientDetails.jsx';
@@ -7,8 +7,10 @@ import FollowUpTracker from './components/FollowUpTracker.jsx';
 import ExcelManager from './components/ExcelManager.jsx';
 import Login from './components/Login.jsx';
 import AdminPanel from './components/AdminPanel.jsx';
+import pkg from '../package.json';
 
 const SESSION_STORAGE_KEY = 'popms_session';
+const SIDEBAR_COLLAPSED_KEY = 'popms_sidebar_collapsed';
 
 function loadStoredSession() {
   try {
@@ -19,9 +21,18 @@ function loadStoredSession() {
   }
 }
 
+function loadStoredSidebarCollapsed() {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
 function App() {
   const [session, setSession] = useState(loadStoredSession);
   const [userRole, setUserRole] = useState(() => loadStoredSession()?.role || 'doctor');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(loadStoredSidebarCollapsed);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedPatientId, setSelectedPatientId] = useState(null);
   const [dbStatus, setDbStatus] = useState({ dbEngine: null });
@@ -106,6 +117,18 @@ function App() {
     persistSession(null);
   };
 
+  const toggleSidebar = () => {
+    setSidebarCollapsed(prev => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next));
+      } catch {
+        // localStorage unavailable — collapsed state just won't persist across reloads
+      }
+      return next;
+    });
+  };
+
   // Render sub-components based on activeTab
   const renderContent = () => {
     switch (activeTab) {
@@ -188,7 +211,15 @@ function App() {
   return (
     <div className="app-container">
       {/* Sidebar Navigation */}
-      <aside className="app-sidebar">
+      <aside className={`app-sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
+        <button
+          className="sidebar-toggle-btn"
+          onClick={toggleSidebar}
+          title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+        </button>
+
         <div className="brand-section">
           <div className="brand-logo-icon">
             <HeartPulse size={26} />
@@ -248,30 +279,29 @@ function App() {
         </nav>
 
         {/* Logged in User profile & Logout */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '20px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '0.8rem', color: '#94a3b8', padding: '0 8px' }}>
-            <span style={{ fontWeight: 700, color: '#ffffff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={session.user?.email}>
+        <div className="sidebar-user-block">
+          <div className="sidebar-user-info">
+            <span className="sidebar-user-email" title={session.user?.email}>
               {session.user?.email}
             </span>
-            <span style={{ textTransform: 'uppercase', fontSize: '0.7rem', fontWeight: 700, color: isAdmin ? 'var(--danger)' : 'var(--secondary)' }}>
+            <span className={`sidebar-user-role ${isAdmin ? 'admin' : 'doctor'}`}>
               Role: {userRole}
             </span>
           </div>
-          <button className="btn btn-outline btn-sm" onClick={handleLogout} style={{ width: '100%', justifyContent: 'center', backgroundColor: 'transparent', borderColor: 'rgba(255,255,255,0.12)', color: '#94a3b8' }}>
+          <button className="btn btn-outline btn-sm sidebar-logout-btn" onClick={handleLogout}>
             <LogOut size={14} />
-            Log Out
+            <span>Log Out</span>
           </button>
         </div>
 
         <div className="sidebar-footer" style={{ marginTop: '20px' }}>
-          <Sparkles size={14} style={{ color: '#fbbf24', marginBottom: '4px' }} />
-          <div>Kings Hospital</div>
-          <div>v1.2.0 (Sheets / Drive)</div>
+          <div>Version {pkg.version}</div>
+          <div>&copy; {new Date().getFullYear()} PBD</div>
         </div>
       </aside>
 
       {/* Main workspace */}
-      <main className="app-main">
+      <main className={`app-main ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         {renderContent()}
       </main>
     </div>
